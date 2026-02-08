@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "thesis"
 version = "0.1.0"
 description = "Local thesis workspace utilities"
-requires-python = ">=3.9"
+requires-python = ">=3.8"
 dependencies = [
   "numpy",
   "torch",
