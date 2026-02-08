@@ -1,0 +1,31 @@
+# Environments
+.venv/
+.env/
+__pycache__/
+*.pyc
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
+
+# Checkpoints / weights
+*.pth
+*.pt
+*.ckpt
+
+# Cache
+.cache/
+
+# ViT-Adapter ops build
+ViT-Adapter/detection/ops/build/
+ViT-Adapter/detection/ops/*.so
