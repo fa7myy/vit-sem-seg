@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thesis"
+version = "0.1.0"
+description = "Local thesis workspace utilities"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy",
+  "torch",
+  "torchvision",
+  "timm",
+]
+
+[tool.setuptools]
+packages = []
