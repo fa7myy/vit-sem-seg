@@ -305,20 +305,28 @@ def main() -> None:
         raise ValueError("--data-root is required unless --dry-run is set.")
 
     transform = VocTransform(args.img_size)
-    train_set = VOCSegmentation(
-        root=args.data_root,
-        year="2012",
-        image_set="train",
-        download=bool(args.download),
-        transforms=transform,
-    )
-    val_set = VOCSegmentation(
-        root=args.data_root,
-        year="2012",
-        image_set="val",
-        download=bool(args.download),
-        transforms=transform,
-    )
+    try:
+        train_set = VOCSegmentation(
+            root=args.data_root,
+            year="2012",
+            image_set="train",
+            download=bool(args.download),
+            transforms=transform,
+        )
+        val_set = VOCSegmentation(
+            root=args.data_root,
+            year="2012",
+            image_set="val",
+            download=bool(args.download),
+            transforms=transform,
+        )
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"VOC load failed at data_root='{args.data_root}'. "
+            "Expected layout: <data_root>/VOC2012 with subfolders JPEGImages, SegmentationClass, "
+            "ImageSets/Segmentation, etc. If VOC2012 lives elsewhere, point --data-root to its parent. "
+            "Original error: " + str(e)
+        ) from e
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
