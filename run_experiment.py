@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Standalone linear probe with swappable ViT-B backbones (DINOv2/CLIP/MAE) + ViT-Adapter + linear pixel head.
+Standalone linear probe with swappable ViT-B backbones (DINOv2/CLIP/MAE) + ViT-Adapter + multi-scale head.
 Run from /mnt/c/Projects/thesis without modifying the ViT-Adapter repo.
 
 Example:
@@ -16,6 +16,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import os
 import time
 import sys
 from pathlib import Path
@@ -75,27 +76,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timm-model", type=str, default="",
                         help="timm model name to load (defaults per backbone).")
     parser.add_argument("--img-size", type=int, default=512,
-                        help="Input image size (square, must be divisible by 32).")
+                        help="Input image size (square, must be divisible by 32). 384 is a good speed/acc tradeoff.")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--log-interval", type=int, default=20,
                         help="Print training loss every N iterations.")
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--backbone-lr", type=float, default=5e-6,
+                        help="Smaller LR for pretrained transformer blocks.")
+    parser.add_argument("--weight-decay", type=float, default=0.0,
+                        help="Deprecated (use --weight-decay-head).")
+    parser.add_argument("--weight-decay-head", type=float, default=0.0,
+                        help="Weight decay for head + adapter params.")
+    parser.add_argument("--weight-decay-backbone", type=float, default=0.05,
+                        help="Weight decay for transformer backbone params.")
     parser.add_argument("--eval-every", type=int, default=1)
+    parser.add_argument("--grad-clip", type=float, default=1.0,
+                        help="Global grad-norm clip (0 disables).")
     parser.add_argument("--save", type=str, default="",
                         help="Optional checkpoint path to save after training.")
     parser.add_argument("--eval-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true",
                         help="Run a single forward pass on random input and exit.")
     parser.add_argument("--amp", action="store_true", help="Use mixed precision.")
+    parser.add_argument("--torch-compile", action="store_true",
+                        help="Use torch.compile when available (CUDA + torch>=2.0).")
     add_bool_arg(parser, "freeze-backbone", True,
                  "Freeze ViT-Adapter backbone (linear probe). Use --no-freeze-backbone to train all.")
+    parser.add_argument("--unfreeze-at-epoch", type=int, default=-1,
+                        help="Epoch (1-indexed) to unfreeze last transformer blocks; -1 disables.")
+    parser.add_argument("--unfreeze-last-n-blocks", type=int, default=4,
+                        help="Number of final transformer blocks to unfreeze.")
     add_bool_arg(parser, "syncbn", False,
                  "Use SyncBatchNorm (requires torch.distributed). By default converts SyncBN to BN for single GPU.")
     add_bool_arg(parser, "with-cp", False,
                  "Enable gradient checkpointing (with_cp) in ViT-Adapter to save memory.")
+    add_bool_arg(parser, "miou-ignore-empty", True,
+                 "Compute mIoU over classes with non-empty union.")
     parser.add_argument("--pretrain-size", type=int, default=0,
                         help="Backbone pretrain resolution (0 selects a sensible default for the chosen backbone).")
     return parser.parse_args()
@@ -119,13 +137,28 @@ class VocTransform:
         return image, target
 
 
-class LinearPixelHead(nn.Module):
-    def __init__(self, in_channels: int, num_classes: int):
+class MultiScaleFPNHead(nn.Module):
+    def __init__(self, in_channels: int, num_classes: int, fpn_dim: int = 256):
         super().__init__()
-        self.proj = nn.Conv2d(in_channels, num_classes, kernel_size=1)
+        self.lateral_convs = nn.ModuleList([
+            nn.Conv2d(in_channels, fpn_dim, kernel_size=1) for _ in range(4)
+        ])
+        self.output_convs = nn.ModuleList([
+            nn.Conv2d(fpn_dim, fpn_dim, kernel_size=3, padding=1) for _ in range(4)
+        ])
+        self.classifier = nn.Conv2d(fpn_dim, num_classes, kernel_size=1)
 
-    def forward(self, feat: torch.Tensor, out_size: Tuple[int, int]) -> torch.Tensor:
-        logits = self.proj(feat)
+    def forward(self, feats: Tuple[torch.Tensor, ...], out_size: Tuple[int, int]) -> torch.Tensor:
+        if len(feats) != 4:
+            raise ValueError("Expected 4 feature maps from ViT-Adapter.")
+        laterals = [conv(feat) for conv, feat in zip(self.lateral_convs, feats)]
+        # Top-down fusion from stride 32 -> 16 -> 8 -> 4.
+        for i in range(3, 0, -1):
+            up = F.interpolate(laterals[i], size=laterals[i - 1].shape[-2:],
+                               mode="bilinear", align_corners=False)
+            laterals[i - 1] = laterals[i - 1] + up
+        outs = [conv(lat) for conv, lat in zip(self.output_convs, laterals)]
+        logits = self.classifier(outs[0])
         if logits.shape[-2:] != out_size:
             logits = F.interpolate(logits, size=out_size, mode="bilinear", align_corners=False)
         return logits
@@ -135,12 +168,11 @@ class ViTAdapterLinearProbe(nn.Module):
     def __init__(self, backbone: nn.Module, num_classes: int):
         super().__init__()
         self.backbone = backbone
-        self.head = LinearPixelHead(in_channels=backbone.embed_dim, num_classes=num_classes)
+        self.head = MultiScaleFPNHead(in_channels=backbone.embed_dim, num_classes=num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feats = self.backbone(x)
-        f1 = feats[0]  # highest resolution (stride 4)
-        return self.head(f1, out_size=x.shape[-2:])
+        return self.head(tuple(feats), out_size=x.shape[-2:])
 
 
 def _clean_state_dict(raw: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -249,12 +281,101 @@ def build_backbone(ViTAdapter, pretrain_size: int, with_cp: bool):
     return backbone
 
 
+def _is_transformer_param(name: str) -> bool:
+    return (
+        name == "pos_embed"
+        or name == "cls_token"
+        or name.startswith("patch_embed.")
+        or name.startswith("blocks.")
+        or name.startswith("norm.")
+    )
+
+
+def _freeze_transformer(backbone: nn.Module) -> None:
+    for name, p in backbone.named_parameters():
+        if _is_transformer_param(name):
+            p.requires_grad = False
+
+
+def _unfreeze_last_blocks(backbone: nn.Module, last_n: int) -> None:
+    if last_n <= 0:
+        return
+    num_blocks = len(backbone.blocks)
+    start = max(0, num_blocks - last_n)
+    for idx, block in enumerate(backbone.blocks):
+        requires = idx >= start
+        for p in block.parameters():
+            p.requires_grad = requires
+    if hasattr(backbone, "norm"):
+        for p in backbone.norm.parameters():
+            p.requires_grad = True
+
+
 def set_trainable(model: nn.Module, freeze_backbone: bool) -> None:
     if freeze_backbone:
+        _freeze_transformer(model.backbone)
+        for name, p in model.backbone.named_parameters():
+            if not _is_transformer_param(name):
+                p.requires_grad = True
+    else:
         for p in model.backbone.parameters():
-            p.requires_grad = False
+            p.requires_grad = True
     for p in model.head.parameters():
         p.requires_grad = True
+
+
+def split_param_groups(model: nn.Module) -> Tuple[list, list]:
+    backbone_params = []
+    head_adapter_params = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name.startswith("backbone."):
+            subname = name[len("backbone."):]
+            if _is_transformer_param(subname):
+                backbone_params.append(p)
+            else:
+                head_adapter_params.append(p)
+        else:
+            head_adapter_params.append(p)
+    return backbone_params, head_adapter_params
+
+
+def build_optimizer(model: nn.Module, args: argparse.Namespace) -> Tuple[torch.optim.Optimizer, list]:
+    backbone_params, head_params = split_param_groups(model)
+    param_groups = []
+    if head_params:
+        param_groups.append({
+            "params": head_params,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay_head,
+        })
+    if backbone_params:
+        # Small backbone LR to avoid overwriting pretrained transformer features.
+        param_groups.append({
+            "params": backbone_params,
+            "lr": args.backbone_lr,
+            "weight_decay": args.weight_decay_backbone,
+        })
+    optimizer = torch.optim.AdamW(param_groups)
+    trainable_params = head_params + backbone_params
+    return optimizer, trainable_params
+
+
+def format_param_count(count: int) -> str:
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.2f}M"
+    if count >= 1_000:
+        return f"{count / 1_000:.2f}K"
+    return str(count)
+
+
+def print_trainable_summary(model: nn.Module, prefix: str) -> None:
+    backbone_params, head_params = split_param_groups(model)
+    backbone_count = sum(p.numel() for p in backbone_params)
+    head_count = sum(p.numel() for p in head_params)
+    print(f"{prefix} trainable params: backbone={format_param_count(backbone_count)} "
+          f"head+adapter={format_param_count(head_count)}")
 
 
 def confusion_matrix(pred: torch.Tensor, target: torch.Tensor,
@@ -271,7 +392,8 @@ def confusion_matrix(pred: torch.Tensor, target: torch.Tensor,
     return hist.cpu()
 
 
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device,
+             miou_ignore_empty: bool) -> Dict[str, float]:
     model.eval()
     hist = torch.zeros((Vocab.num_classes, Vocab.num_classes), dtype=torch.int64)
     with torch.no_grad():
@@ -281,9 +403,17 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict
             logits = model(images)
             preds = logits.argmax(dim=1)
             hist += confusion_matrix(preds, targets, Vocab.num_classes, Vocab.ignore_index)
-    acc = torch.diag(hist).sum().float() / hist.sum().float().clamp(min=1)
-    iu = torch.diag(hist).float() / (hist.sum(1) + hist.sum(0) - torch.diag(hist)).float().clamp(min=1)
-    miou = iu.mean().item()
+    diag = torch.diag(hist).float()
+    acc = diag.sum() / hist.sum().float().clamp(min=1)
+    union = (hist.sum(1) + hist.sum(0) - torch.diag(hist)).float()
+    if miou_ignore_empty:
+        mask = union > 0
+        iu = torch.zeros_like(diag)
+        iu[mask] = diag[mask] / union[mask]
+        miou = iu[mask].mean().item() if mask.any() else 0.0
+    else:
+        iu = diag / union.clamp(min=1)
+        miou = iu.mean().item()
     return {"pixel_acc": acc.item(), "mIoU": miou}
 
 
@@ -293,6 +423,8 @@ def main() -> None:
         raise ValueError("--img-size must be divisible by 32.")
     if args.ckpt and args.timm_model:
         raise ValueError("Provide only one of --ckpt or --timm-model (or neither to use defaults).")
+    if "--weight-decay-head" not in sys.argv and args.weight_decay != 0.0:
+        args.weight_decay_head = args.weight_decay
 
     repo_root = (Path(__file__).resolve().parent / "ViT-Adapter").resolve()
     sys.path.insert(0, str(repo_root / "segmentation"))
@@ -327,13 +459,17 @@ def main() -> None:
         print(f"[load] Unexpected keys: {len(unexpected)}")
 
     set_trainable(model, args.freeze_backbone)
+    print_trainable_summary(model, "[params]")
     model.to(device)
+    model_forward = model
+    if args.torch_compile and device.type == "cuda" and hasattr(torch, "compile"):
+        model_forward = torch.compile(model)
 
     if args.dry_run:
-        model.eval()
+        model_forward.eval()
         x = torch.randn(1, 3, args.img_size, args.img_size, device=device)
         with torch.no_grad():
-            y = model(x)
+            y = model_forward(x)
         print(f"[dry-run] output shape: {tuple(y.shape)}")
         return
 
@@ -379,19 +515,31 @@ def main() -> None:
     )
 
     criterion = nn.CrossEntropyLoss(ignore_index=Vocab.ignore_index)
-    params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+    optimizer, trainable_params = build_optimizer(model, args)
     use_amp = args.amp and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     if args.eval_only:
-        metrics = evaluate(model, val_loader, device)
+        metrics = evaluate(model_forward, val_loader, device, args.miou_ignore_empty)
         print(f"[eval] pixel_acc={metrics['pixel_acc']:.4f} mIoU={metrics['mIoU']:.4f}")
         return
 
+    did_unfreeze = False
+    log_interval = max(1, args.log_interval)
     for epoch in range(1, args.epochs + 1):
-        model.train()
-        running = 0.0
+        # Optional staged unfreezing of the last N transformer blocks.
+        if (args.freeze_backbone and not did_unfreeze and args.unfreeze_at_epoch >= 0
+                and epoch == args.unfreeze_at_epoch):
+            _unfreeze_last_blocks(model.backbone, args.unfreeze_last_n_blocks)
+            optimizer, trainable_params = build_optimizer(model, args)
+            print_trainable_summary(model, f"[params] after unfreeze@{epoch}")
+            did_unfreeze = True
+
+        model_forward.train()
+        running_loss = 0.0
+        running_steps = 0
+        epoch_loss = 0.0
+        epoch_steps = 0
         iter_start = time.time()
         for i, (images, targets) in enumerate(train_loader, 1):
             images = images.to(device, non_blocking=True)
@@ -399,29 +547,35 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=use_amp):
-                logits = model(images)
+                logits = model_forward(images)
                 loss = criterion(logits, targets)
             scaler.scale(loss).backward()
+            if args.grad_clip and args.grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
-            running += loss.item()
 
-            if i % max(1, args.log_interval) == 0:
-                avg = running / max(1, args.log_interval)
+            loss_val = loss.item()
+            running_loss += loss_val
+            running_steps += 1
+            epoch_loss += loss_val
+            epoch_steps += 1
+
+            if i % log_interval == 0:
+                avg = running_loss / max(1, running_steps)
                 elapsed = time.time() - iter_start
                 print(f"[train] epoch={epoch} iter={i}/{len(train_loader)} "
                       f"loss={avg:.4f} batch={images.size(0)} time={elapsed:.2f}s")
-                running = 0.0
+                running_loss = 0.0
+                running_steps = 0
                 iter_start = time.time()
 
-        if running > 0:
-            avg_loss = running / (len(train_loader) % max(1, args.log_interval))
-        else:
-            avg_loss = float("nan")
+        avg_loss = epoch_loss / max(1, epoch_steps)
         print(f"[train] epoch={epoch} avg_loss={avg_loss:.4f}")
 
         if args.eval_every > 0 and epoch % args.eval_every == 0:
-            metrics = evaluate(model, val_loader, device)
+            metrics = evaluate(model_forward, val_loader, device, args.miou_ignore_empty)
             print(f"[eval] epoch={epoch} pixel_acc={metrics['pixel_acc']:.4f} mIoU={metrics['mIoU']:.4f}")
 
     if args.save:
