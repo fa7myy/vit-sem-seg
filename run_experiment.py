@@ -378,6 +378,11 @@ def print_trainable_summary(model: nn.Module, prefix: str) -> None:
           f"head+adapter={format_param_count(head_count)}")
 
 
+def log(msg: str) -> None:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {msg}")
+
+
 def confusion_matrix(pred: torch.Tensor, target: torch.Tensor,
                      num_classes: int, ignore_index: int) -> torch.Tensor:
     mask = target != ignore_index
@@ -454,9 +459,49 @@ def main() -> None:
     state_dict = load_pretrained_state_dict(args.backbone, args.timm_model, args.ckpt)
     missing, unexpected = model.backbone.load_state_dict(state_dict, strict=False)
     if missing:
-        print(f"[load] Missing keys: {len(missing)}")
+        log(f"[load] Missing keys: {len(missing)}")
     if unexpected:
-        print(f"[load] Unexpected keys: {len(unexpected)}")
+        log(f"[load] Unexpected keys: {len(unexpected)}")
+
+    # --- DEBUG: inspect where transformer blocks live & how params are named ---
+    print("\n[debug] backbone top-level children:")
+    for name, mod in model.backbone.named_children():
+        print("  ", name, "->", mod.__class__.__name__)
+
+    # Try common locations for transformer blocks
+    candidates = []
+    if hasattr(model.backbone, "blocks"):
+        candidates.append(("backbone.blocks", model.backbone.blocks))
+    if hasattr(model.backbone, "vit") and hasattr(model.backbone.vit, "blocks"):
+        candidates.append(("backbone.vit.blocks", model.backbone.vit.blocks))
+    if hasattr(model.backbone, "backbone") and hasattr(model.backbone.backbone, "blocks"):
+        candidates.append(("backbone.backbone.blocks", model.backbone.backbone.blocks))
+
+    print("\n[debug] transformer block containers found:")
+    for path, blocks in candidates:
+        try:
+            print(f"  {path}: len={len(blocks)}  block0={blocks[0].__class__.__name__}")
+        except Exception as e:
+            print(f"  {path}: error -> {e}")
+
+    print("\n[debug] first 80 backbone parameter names:")
+    for i, (n, p) in enumerate(model.backbone.named_parameters()):
+        if i >= 80:
+            break
+        print(f"  {i:03d} {n}  shape={tuple(p.shape)}")
+
+    # Also show a few that contain 'blocks' / 'patch_embed' / 'norm'
+    keys = ["blocks", "patch_embed", "norm", "pos_embed", "cls_token", "vit."]
+    print("\n[debug] sample backbone params containing key substrings:")
+    hits = 0
+    for n, p in model.backbone.named_parameters():
+        if any(k in n for k in keys):
+            print("  ", n)
+            hits += 1
+            if hits >= 40:
+                break
+    print("[debug] done\n")
+    # --- END DEBUG ---
 
     set_trainable(model, args.freeze_backbone)
     print_trainable_summary(model, "[params]")
@@ -470,7 +515,7 @@ def main() -> None:
         x = torch.randn(1, 3, args.img_size, args.img_size, device=device)
         with torch.no_grad():
             y = model_forward(x)
-        print(f"[dry-run] output shape: {tuple(y.shape)}")
+        log(f"[dry-run] output shape: {tuple(y.shape)}")
         return
 
     if not args.data_root:
@@ -520,12 +565,15 @@ def main() -> None:
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     if args.eval_only:
+        eval_start = time.time()
         metrics = evaluate(model_forward, val_loader, device, args.miou_ignore_empty)
-        print(f"[eval] pixel_acc={metrics['pixel_acc']:.4f} mIoU={metrics['mIoU']:.4f}")
+        log(f"[eval] pixel_acc={metrics['pixel_acc']:.4f} mIoU={metrics['mIoU']:.4f} "
+            f"time={time.time() - eval_start:.2f}s")
         return
 
     did_unfreeze = False
     log_interval = max(1, args.log_interval)
+    run_start = time.time()
     for epoch in range(1, args.epochs + 1):
         # Optional staged unfreezing of the last N transformer blocks.
         if (args.freeze_backbone and not did_unfreeze and args.unfreeze_at_epoch >= 0
@@ -535,6 +583,7 @@ def main() -> None:
             print_trainable_summary(model, f"[params] after unfreeze@{epoch}")
             did_unfreeze = True
 
+        epoch_start = time.time()
         model_forward.train()
         running_loss = 0.0
         running_steps = 0
@@ -565,23 +614,25 @@ def main() -> None:
             if i % log_interval == 0:
                 avg = running_loss / max(1, running_steps)
                 elapsed = time.time() - iter_start
-                print(f"[train] epoch={epoch} iter={i}/{len(train_loader)} "
-                      f"loss={avg:.4f} batch={images.size(0)} time={elapsed:.2f}s")
+                log(f"[train] epoch={epoch} iter={i}/{len(train_loader)} "
+                    f"loss={avg:.4f} batch={images.size(0)} time={elapsed:.2f}s")
                 running_loss = 0.0
                 running_steps = 0
                 iter_start = time.time()
 
         avg_loss = epoch_loss / max(1, epoch_steps)
-        print(f"[train] epoch={epoch} avg_loss={avg_loss:.4f}")
+        log(f"[train] epoch={epoch} avg_loss={avg_loss:.4f} time={time.time() - epoch_start:.2f}s")
 
         if args.eval_every > 0 and epoch % args.eval_every == 0:
+            eval_start = time.time()
             metrics = evaluate(model_forward, val_loader, device, args.miou_ignore_empty)
-            print(f"[eval] epoch={epoch} pixel_acc={metrics['pixel_acc']:.4f} mIoU={metrics['mIoU']:.4f}")
+            log(f"[eval] epoch={epoch} pixel_acc={metrics['pixel_acc']:.4f} mIoU={metrics['mIoU']:.4f} "
+                f"time={time.time() - eval_start:.2f}s")
 
     if args.save:
         os.makedirs(Path(args.save).parent, exist_ok=True)
         torch.save({"model": model.state_dict(), "args": vars(args)}, args.save)
-        print(f"[save] {args.save}")
+        log(f"[save] {args.save} total_time={time.time() - run_start:.2f}s")
 
 
 if __name__ == "__main__":
