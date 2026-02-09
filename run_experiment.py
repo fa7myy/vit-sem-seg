@@ -50,12 +50,23 @@ DEFAULT_PRETRAIN_SIZE = {
 }
 
 
+def add_bool_arg(parser: argparse.ArgumentParser, name: str, default: bool, help_text: str):
+    """
+    Adds paired --name / --no-name flags that set a boolean dest.
+    Compatible with Python versions < 3.9 that lack BooleanOptionalAction.
+    """
+    dest = name.replace("-", "_")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(f"--{name}", dest=dest, action="store_true", help=help_text + " (default: {})".format(default))
+    group.add_argument(f"--no-{name}", dest=dest, action="store_false", help="Disable " + help_text.lower())
+    parser.set_defaults(**{dest: default})
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ViT-Adapter linear probe (VOC2012) with DINOv2/CLIP/MAE backbones.")
     parser.add_argument("--data-root", type=str, default="",
                         help="Path containing VOCdevkit (torchvision VOCSegmentation root).")
-    parser.add_argument("--download", action=argparse.BooleanOptionalAction, default=True,
-                        help="Download VOC2012 via torchvision if not present.")
+    add_bool_arg(parser, "download", True, "Download VOC2012 via torchvision if not present.")
     parser.add_argument("--backbone", type=str, choices=["dinov2", "clip", "mae"], default="dinov2",
                         help="Pretrained ViT-B source.")
     parser.add_argument("--ckpt", type=str, default="",
@@ -76,8 +87,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true",
                         help="Run a single forward pass on random input and exit.")
     parser.add_argument("--amp", action="store_true", help="Use mixed precision.")
-    parser.add_argument("--freeze-backbone", action=argparse.BooleanOptionalAction, default=True,
-                        help="Freeze ViT-Adapter backbone (linear probe). Use --no-freeze-backbone to train all.")
+    add_bool_arg(parser, "freeze-backbone", True,
+                 "Freeze ViT-Adapter backbone (linear probe). Use --no-freeze-backbone to train all.")
     parser.add_argument("--pretrain-size", type=int, default=0,
                         help="Backbone pretrain resolution (0 selects a sensible default for the chosen backbone).")
     return parser.parse_args()
