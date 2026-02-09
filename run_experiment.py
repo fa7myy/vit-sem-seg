@@ -16,6 +16,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import time
 import sys
 from pathlib import Path
 from typing import Dict, Tuple
@@ -78,6 +79,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--log-interval", type=int, default=20,
+                        help="Print training loss every N iterations.")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--eval-every", type=int, default=1)
@@ -91,6 +94,8 @@ def parse_args() -> argparse.Namespace:
                  "Freeze ViT-Adapter backbone (linear probe). Use --no-freeze-backbone to train all.")
     add_bool_arg(parser, "syncbn", False,
                  "Use SyncBatchNorm (requires torch.distributed). By default converts SyncBN to BN for single GPU.")
+    add_bool_arg(parser, "with-cp", False,
+                 "Enable gradient checkpointing (with_cp) in ViT-Adapter to save memory.")
     parser.add_argument("--pretrain-size", type=int, default=0,
                         help="Backbone pretrain resolution (0 selects a sensible default for the chosen backbone).")
     return parser.parse_args()
@@ -218,7 +223,7 @@ def convert_syncbn_to_bn(module: nn.Module) -> nn.Module:
     return module_output
 
 
-def build_backbone(ViTAdapter, pretrain_size: int):
+def build_backbone(ViTAdapter, pretrain_size: int, with_cp: bool):
     backbone = ViTAdapter(
         pretrain_size=pretrain_size,
         img_size=pretrain_size,
@@ -239,7 +244,7 @@ def build_backbone(ViTAdapter, pretrain_size: int):
         window_size=[14, 14, None, 14, 14, None,
                      14, 14, None, 14, 14, None],
         pretrained=None,
-        with_cp=False,
+        with_cp=with_cp,
     )
     return backbone
 
@@ -307,7 +312,7 @@ def main() -> None:
         torch.backends.cudnn.benchmark = True
 
     pretrain_size = resolve_pretrain_size(args.backbone, args.pretrain_size)
-    backbone = build_backbone(ViTAdapter, pretrain_size)
+    backbone = build_backbone(ViTAdapter, pretrain_size, with_cp=args.with_cp)
     model = ViTAdapterLinearProbe(backbone=backbone, num_classes=Vocab.num_classes)
     if args.syncbn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -387,7 +392,8 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         model.train()
         running = 0.0
-        for images, targets in train_loader:
+        iter_start = time.time()
+        for i, (images, targets) in enumerate(train_loader, 1):
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
@@ -400,8 +406,19 @@ def main() -> None:
             scaler.update()
             running += loss.item()
 
-        avg_loss = running / max(1, len(train_loader))
-        print(f"[train] epoch={epoch} loss={avg_loss:.4f}")
+            if i % max(1, args.log_interval) == 0:
+                avg = running / max(1, args.log_interval)
+                elapsed = time.time() - iter_start
+                print(f"[train] epoch={epoch} iter={i}/{len(train_loader)} "
+                      f"loss={avg:.4f} batch={images.size(0)} time={elapsed:.2f}s")
+                running = 0.0
+                iter_start = time.time()
+
+        if running > 0:
+            avg_loss = running / (len(train_loader) % max(1, args.log_interval))
+        else:
+            avg_loss = float("nan")
+        print(f"[train] epoch={epoch} avg_loss={avg_loss:.4f}")
 
         if args.eval_every > 0 and epoch % args.eval_every == 0:
             metrics = evaluate(model, val_loader, device)
