@@ -89,6 +89,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp", action="store_true", help="Use mixed precision.")
     add_bool_arg(parser, "freeze-backbone", True,
                  "Freeze ViT-Adapter backbone (linear probe). Use --no-freeze-backbone to train all.")
+    add_bool_arg(parser, "syncbn", False,
+                 "Use SyncBatchNorm (requires torch.distributed). By default converts SyncBN to BN for single GPU.")
     parser.add_argument("--pretrain-size", type=int, default=0,
                         help="Backbone pretrain resolution (0 selects a sensible default for the chosen backbone).")
     return parser.parse_args()
@@ -190,6 +192,32 @@ def load_pretrained_state_dict(backbone: str, timm_model: str, ckpt_path: str) -
     return load_state_dict_from_timm(model_name)
 
 
+def convert_syncbn_to_bn(module: nn.Module) -> nn.Module:
+    """Recursively replace SyncBatchNorm with BatchNorm2d for single-GPU usage."""
+    module_output = module
+    if isinstance(module, nn.SyncBatchNorm):
+        module_output = nn.BatchNorm2d(
+            module.num_features,
+            eps=module.eps,
+            momentum=module.momentum,
+            affine=module.affine,
+            track_running_stats=module.track_running_stats,
+        )
+        if module.affine:
+            with torch.no_grad():
+                module_output.weight = module.weight
+                module_output.bias = module.bias
+        module_output.running_mean = module.running_mean
+        module_output.running_var = module.running_var
+        module_output.num_batches_tracked = module.num_batches_tracked
+    else:
+        for name, child in module.named_children():
+            new_child = convert_syncbn_to_bn(child)
+            if new_child is not child:
+                module_output.add_module(name, new_child)
+    return module_output
+
+
 def build_backbone(ViTAdapter, pretrain_size: int):
     backbone = ViTAdapter(
         pretrain_size=pretrain_size,
@@ -281,7 +309,10 @@ def main() -> None:
     pretrain_size = resolve_pretrain_size(args.backbone, args.pretrain_size)
     backbone = build_backbone(ViTAdapter, pretrain_size)
     model = ViTAdapterLinearProbe(backbone=backbone, num_classes=Vocab.num_classes)
-    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    if args.syncbn:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    else:
+        model = convert_syncbn_to_bn(model)
 
     state_dict = load_pretrained_state_dict(args.backbone, args.timm_model, args.ckpt)
     missing, unexpected = model.backbone.load_state_dict(state_dict, strict=False)
