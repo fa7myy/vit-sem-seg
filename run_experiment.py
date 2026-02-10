@@ -108,12 +108,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Global grad-norm clip (0 disables).")
-    parser.add_argument("--save", type=str, default="",
-                        help="Optional final checkpoint path to save after training.")
-    add_bool_arg(parser, "save-best", True,
-                 "Save best checkpoint by validation mIoU.")
-    parser.add_argument("--save-best-path", type=str, default="",
-                        help="Optional path for best checkpoint (default derived from --save).")
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Save final and best checkpoints under <run_dir>/checkpoints/ using fixed names.",
+    )
     parser.add_argument("--eval-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true",
                         help="Run a single forward pass on random input and exit.")
@@ -207,21 +206,13 @@ def make_run_dir(output_dir: str, run_name: str) -> Path:
         suffix += 1
 
 
-def default_best_ckpt_path(final_ckpt_path: str) -> str:
-    if not final_ckpt_path:
-        return ""
-    path = Path(final_ckpt_path)
-    if path.suffix:
-        return str(path.with_name(f"{path.stem}_best{path.suffix}"))
-    return str(path.with_name(f"{path.name}_best"))
-
-
-def resolve_best_ckpt_path(args: argparse.Namespace) -> str:
-    if not args.save_best:
-        return ""
-    if args.save_best_path:
-        return args.save_best_path
-    return default_best_ckpt_path(args.save)
+def resolve_checkpoint_paths(save: bool, run_dir: Path, run_name: str) -> Tuple[str, str]:
+    if not save:
+        return "", ""
+    checkpoints_dir = run_dir / "checkpoints"
+    final_ckpt_path = checkpoints_dir / f"{run_name}_final.pth"
+    best_ckpt_path = checkpoints_dir / f"{run_name}_best.pth"
+    return str(final_ckpt_path), str(best_ckpt_path)
 
 
 def collect_env_info(device: torch.device) -> Dict[str, Any]:
@@ -583,11 +574,10 @@ def main() -> None:
     seed_everything(args.seed, args.deterministic)
 
     run_name = args.run_name or default_run_name(args)
-    run_dir: Path | None = None
+    run_dir = make_run_dir(args.output_dir, run_name)
+    run_name = run_dir.name
     run_logger: RunLogger | None = None
     if args.save_logs:
-        run_dir = make_run_dir(args.output_dir, run_name)
-        run_name = run_dir.name
         run_logger = RunLogger(run_dir)
 
     repo_root = (Path(__file__).resolve().parent / "ViT-Adapter").resolve()
@@ -624,17 +614,16 @@ def main() -> None:
         },
         "environment": collect_env_info(device),
     }
-    best_ckpt_path = resolve_best_ckpt_path(args)
+    final_ckpt_path, best_ckpt_path = resolve_checkpoint_paths(args.save, run_dir, run_name)
     run_info["checkpointing"] = {
-        "final_checkpoint_path": args.save if args.save else None,
-        "save_best": bool(best_ckpt_path),
+        "save_checkpoints": bool(args.save),
+        "final_checkpoint_path": final_ckpt_path if final_ckpt_path else None,
         "best_checkpoint_path": best_ckpt_path if best_ckpt_path else None,
     }
-    if run_dir is not None:
-        run_info["run_dir"] = str(run_dir.resolve())
+    run_info["run_dir"] = str(run_dir.resolve())
     if run_logger is not None:
         run_logger.write_json("run_config.json", run_info)
-        log(f"[run] logging artifacts to {run_dir}", run_logger)
+    log(f"[run] run directory: {run_dir}", run_logger)
 
     backbone = build_backbone(ViTAdapter, pretrain_size, with_cp=args.with_cp)
     model = ViTAdapterLinearProbe(backbone=backbone, num_classes=Vocab.num_classes)
@@ -976,14 +965,12 @@ def main() -> None:
         summary["final_eval"] = eval_history[-1]
     if best_epoch >= 0 and best_ckpt_path:
         summary["best_checkpoint_path"] = best_ckpt_path
-    elif args.save_best and not best_ckpt_path:
-        log("[save] best checkpoint disabled because neither --save nor --save-best-path was provided.", run_logger)
 
-    if args.save:
-        os.makedirs(Path(args.save).parent, exist_ok=True)
-        torch.save({"model": model.state_dict(), "args": vars(args), "summary": summary}, args.save)
-        summary["checkpoint_path"] = args.save
-        log(f"[save] {args.save} total_time={summary['total_time_sec']:.2f}s", run_logger)
+    if final_ckpt_path:
+        os.makedirs(Path(final_ckpt_path).parent, exist_ok=True)
+        torch.save({"model": model.state_dict(), "args": vars(args), "summary": summary}, final_ckpt_path)
+        summary["checkpoint_path"] = final_ckpt_path
+        log(f"[save] {final_ckpt_path} total_time={summary['total_time_sec']:.2f}s", run_logger)
 
     if run_logger is not None:
         run_logger.write_json("summary.json", summary)
