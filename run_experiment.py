@@ -206,13 +206,14 @@ def make_run_dir(output_dir: str, run_name: str) -> Path:
         suffix += 1
 
 
-def resolve_checkpoint_paths(save: bool, run_dir: Path, run_name: str) -> Tuple[str, str]:
+def resolve_checkpoint_paths(save: bool, run_dir: Path, run_name: str) -> Tuple[str, str, str]:
     if not save:
-        return "", ""
+        return "", "", ""
     checkpoints_dir = run_dir / "checkpoints"
     final_ckpt_path = checkpoints_dir / f"{run_name}_final.pth"
     best_ckpt_path = checkpoints_dir / f"{run_name}_best.pth"
-    return str(final_ckpt_path), str(best_ckpt_path)
+    interrupted_ckpt_path = checkpoints_dir / f"{run_name}_interrupted.pth"
+    return str(final_ckpt_path), str(best_ckpt_path), str(interrupted_ckpt_path)
 
 
 def collect_env_info(device: torch.device) -> Dict[str, Any]:
@@ -614,11 +615,12 @@ def main() -> None:
         },
         "environment": collect_env_info(device),
     }
-    final_ckpt_path, best_ckpt_path = resolve_checkpoint_paths(args.save, run_dir, run_name)
+    final_ckpt_path, best_ckpt_path, interrupted_ckpt_path = resolve_checkpoint_paths(args.save, run_dir, run_name)
     run_info["checkpointing"] = {
         "save_checkpoints": bool(args.save),
         "final_checkpoint_path": final_ckpt_path if final_ckpt_path else None,
         "best_checkpoint_path": best_ckpt_path if best_ckpt_path else None,
+        "interrupted_checkpoint_path": interrupted_ckpt_path if interrupted_ckpt_path else None,
     }
     run_info["run_dir"] = str(run_dir.resolve())
     if run_logger is not None:
@@ -826,128 +828,161 @@ def main() -> None:
     eval_history: List[Dict[str, Any]] = []
     best_miou = float("-inf")
     best_epoch = -1
-    for epoch in range(1, args.epochs + 1):
-        # Optional staged unfreezing of the last N transformer blocks.
-        if (args.freeze_backbone and not did_unfreeze and args.unfreeze_at_epoch >= 0
-                and epoch == args.unfreeze_at_epoch):
-            _unfreeze_last_blocks(model.backbone, args.unfreeze_last_n_blocks)
-            optimizer, trainable_params = build_optimizer(model, args)
-            print_trainable_summary(model, f"[params] after unfreeze@{epoch}")
-            did_unfreeze = True
+    interrupted = False
+    interrupted_epoch = 0
+    interrupted_iter = 0
+    try:
+        for epoch in range(1, args.epochs + 1):
+            interrupted_epoch = epoch
+            interrupted_iter = 0
+            # Optional staged unfreezing of the last N transformer blocks.
+            if (args.freeze_backbone and not did_unfreeze and args.unfreeze_at_epoch >= 0
+                    and epoch == args.unfreeze_at_epoch):
+                _unfreeze_last_blocks(model.backbone, args.unfreeze_last_n_blocks)
+                optimizer, trainable_params = build_optimizer(model, args)
+                print_trainable_summary(model, f"[params] after unfreeze@{epoch}")
+                did_unfreeze = True
 
-        epoch_start = time.time()
-        model_forward.train()
-        running_loss = 0.0
-        running_steps = 0
-        epoch_loss = 0.0
-        epoch_steps = 0
-        iter_start = time.time()
-        for i, (images, targets) in enumerate(train_loader, 1):
-            images = images.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
+            epoch_start = time.time()
+            model_forward.train()
+            running_loss = 0.0
+            running_steps = 0
+            epoch_loss = 0.0
+            epoch_steps = 0
+            iter_start = time.time()
+            for i, (images, targets) in enumerate(train_loader, 1):
+                interrupted_iter = i
+                images = images.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
 
-            optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                logits = model_forward(images)
-                loss = criterion(logits, targets)
-            scaler.scale(loss).backward()
-            if args.grad_clip and args.grad_clip > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    logits = model_forward(images)
+                    loss = criterion(logits, targets)
+                scaler.scale(loss).backward()
+                if args.grad_clip and args.grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
 
-            loss_val = loss.item()
-            running_loss += loss_val
-            running_steps += 1
-            epoch_loss += loss_val
-            epoch_steps += 1
+                loss_val = loss.item()
+                running_loss += loss_val
+                running_steps += 1
+                epoch_loss += loss_val
+                epoch_steps += 1
 
-            if i % log_interval == 0:
-                avg = running_loss / max(1, running_steps)
-                elapsed = time.time() - iter_start
-                log(
-                    f"[train] epoch={epoch} iter={i}/{len(train_loader)} "
-                    f"loss={avg:.4f} batch={images.size(0)} time={elapsed:.2f}s",
-                    run_logger,
-                )
-                running_loss = 0.0
-                running_steps = 0
-                iter_start = time.time()
+                if i % log_interval == 0:
+                    avg = running_loss / max(1, running_steps)
+                    elapsed = time.time() - iter_start
+                    log(
+                        f"[train] epoch={epoch} iter={i}/{len(train_loader)} "
+                        f"loss={avg:.4f} batch={images.size(0)} time={elapsed:.2f}s",
+                        run_logger,
+                    )
+                    running_loss = 0.0
+                    running_steps = 0
+                    iter_start = time.time()
 
-        avg_loss = epoch_loss / max(1, epoch_steps)
-        epoch_time = time.time() - epoch_start
-        train_row = {
-            "epoch": epoch,
-            "avg_loss": avg_loss,
-            "steps": epoch_steps,
-            "epoch_time_sec": epoch_time,
-        }
-        train_history.append(train_row)
-        if run_logger is not None:
-            run_logger.log_train_epoch(train_row)
-        log(f"[train] epoch={epoch} avg_loss={avg_loss:.4f} time={epoch_time:.2f}s", run_logger)
-
-        if args.eval_every > 0 and epoch % args.eval_every == 0:
-            eval_start = time.time()
-            metrics = evaluate(
-                model_forward,
-                val_loader,
-                device,
-                Vocab.num_classes,
-                Vocab.ignore_index,
-                args.miou_ignore_empty,
-                args.measure_inference_time,
-            )
-            eval_time = time.time() - eval_start
-            eval_row = {
+            avg_loss = epoch_loss / max(1, epoch_steps)
+            epoch_time = time.time() - epoch_start
+            train_row = {
                 "epoch": epoch,
-                "pixel_acc": metrics["pixel_acc"],
-                "mIoU": metrics["mIoU"],
-                "mean_class_acc": metrics["mean_class_acc"],
-                "eval_time_sec": eval_time,
-                "model_forward_time_sec": metrics["model_forward_time_sec"],
-                "mean_inference_time_ms": metrics["mean_inference_time_ms"],
-                "throughput_img_s": metrics["throughput_img_s"],
-                "num_eval_images": metrics["num_eval_images"],
+                "avg_loss": avg_loss,
+                "steps": epoch_steps,
+                "epoch_time_sec": epoch_time,
             }
-            eval_history.append(eval_row)
-            if best_ckpt_path and eval_row["mIoU"] > best_miou:
-                best_miou = eval_row["mIoU"]
-                best_epoch = epoch
-                os.makedirs(Path(best_ckpt_path).parent, exist_ok=True)
-                torch.save(
-                    {
-                        "model": model.state_dict(),
-                        "args": vars(args),
-                        "best": {"epoch": best_epoch, "mIoU": best_miou},
-                    },
-                    best_ckpt_path,
+            train_history.append(train_row)
+            if run_logger is not None:
+                run_logger.log_train_epoch(train_row)
+            log(f"[train] epoch={epoch} avg_loss={avg_loss:.4f} time={epoch_time:.2f}s", run_logger)
+            interrupted_iter = 0
+
+            if args.eval_every > 0 and epoch % args.eval_every == 0:
+                eval_start = time.time()
+                metrics = evaluate(
+                    model_forward,
+                    val_loader,
+                    device,
+                    Vocab.num_classes,
+                    Vocab.ignore_index,
+                    args.miou_ignore_empty,
+                    args.measure_inference_time,
                 )
+                eval_time = time.time() - eval_start
+                eval_row = {
+                    "epoch": epoch,
+                    "pixel_acc": metrics["pixel_acc"],
+                    "mIoU": metrics["mIoU"],
+                    "mean_class_acc": metrics["mean_class_acc"],
+                    "eval_time_sec": eval_time,
+                    "model_forward_time_sec": metrics["model_forward_time_sec"],
+                    "mean_inference_time_ms": metrics["mean_inference_time_ms"],
+                    "throughput_img_s": metrics["throughput_img_s"],
+                    "num_eval_images": metrics["num_eval_images"],
+                }
+                eval_history.append(eval_row)
+                if best_ckpt_path and eval_row["mIoU"] > best_miou:
+                    best_miou = eval_row["mIoU"]
+                    best_epoch = epoch
+                    os.makedirs(Path(best_ckpt_path).parent, exist_ok=True)
+                    torch.save(
+                        {
+                            "model": model.state_dict(),
+                            "args": vars(args),
+                            "best": {"epoch": best_epoch, "mIoU": best_miou},
+                        },
+                        best_ckpt_path,
+                    )
+                    log(
+                        f"[save] best path={best_ckpt_path} epoch={best_epoch} mIoU={best_miou:.4f}",
+                        run_logger,
+                    )
+                if run_logger is not None:
+                    run_logger.log_eval_epoch(eval_row)
+                    save_confusion_matrix_csv(run_logger.run_dir, epoch, metrics["confusion_matrix"])
+                    save_class_metrics_csv(
+                        run_logger.run_dir,
+                        epoch,
+                        metrics["per_class_iou"],
+                        metrics["per_class_acc"],
+                        metrics["gt_count"],
+                        metrics["union"],
+                    )
                 log(
-                    f"[save] best path={best_ckpt_path} epoch={best_epoch} mIoU={best_miou:.4f}",
+                    f"[eval] epoch={epoch} pixel_acc={metrics['pixel_acc']:.4f} "
+                    f"mIoU={metrics['mIoU']:.4f} mean_class_acc={metrics['mean_class_acc']:.4f} "
+                    f"time={eval_time:.2f}s infer={metrics['mean_inference_time_ms']:.2f}ms/img",
                     run_logger,
                 )
-            if run_logger is not None:
-                run_logger.log_eval_epoch(eval_row)
-                save_confusion_matrix_csv(run_logger.run_dir, epoch, metrics["confusion_matrix"])
-                save_class_metrics_csv(
-                    run_logger.run_dir,
-                    epoch,
-                    metrics["per_class_iou"],
-                    metrics["per_class_acc"],
-                    metrics["gt_count"],
-                    metrics["union"],
-                )
-            log(
-                f"[eval] epoch={epoch} pixel_acc={metrics['pixel_acc']:.4f} "
-                f"mIoU={metrics['mIoU']:.4f} mean_class_acc={metrics['mean_class_acc']:.4f} "
-                f"time={eval_time:.2f}s infer={metrics['mean_inference_time_ms']:.2f}ms/img",
-                run_logger,
+    except KeyboardInterrupt:
+        interrupted = True
+        log(
+            f"[interrupt] Ctrl+C received at epoch={interrupted_epoch} iter={interrupted_iter}.",
+            run_logger,
+        )
+        if interrupted_ckpt_path:
+            os.makedirs(Path(interrupted_ckpt_path).parent, exist_ok=True)
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "args": vars(args),
+                    "interrupt": {
+                        "epoch": interrupted_epoch,
+                        "iter": interrupted_iter,
+                        "time": datetime.now().isoformat(timespec="seconds"),
+                    },
+                    "best": {"epoch": best_epoch, "mIoU": best_miou if best_epoch >= 0 else None},
+                    "train_history": train_history,
+                    "eval_history": eval_history,
+                },
+                interrupted_ckpt_path,
             )
+            log(f"[save] interrupted checkpoint path={interrupted_ckpt_path}", run_logger)
 
     summary: Dict[str, Any] = {
         "mode": "train",
+        "status": "interrupted" if interrupted else "completed",
         "finished_at": datetime.now().isoformat(timespec="seconds"),
         "total_time_sec": time.time() - run_start_ts,
         "epochs": args.epochs,
@@ -963,10 +998,15 @@ def main() -> None:
         summary["best_mIoU"] = best["mIoU"]
         summary["best_epoch"] = best["epoch"]
         summary["final_eval"] = eval_history[-1]
+    if interrupted:
+        summary["interrupted_epoch"] = interrupted_epoch
+        summary["interrupted_iter"] = interrupted_iter
     if best_epoch >= 0 and best_ckpt_path:
         summary["best_checkpoint_path"] = best_ckpt_path
+    if interrupted and interrupted_ckpt_path:
+        summary["interrupted_checkpoint_path"] = interrupted_ckpt_path
 
-    if final_ckpt_path:
+    if final_ckpt_path and not interrupted:
         os.makedirs(Path(final_ckpt_path).parent, exist_ok=True)
         torch.save({"model": model.state_dict(), "args": vars(args), "summary": summary}, final_ckpt_path)
         summary["checkpoint_path"] = final_ckpt_path

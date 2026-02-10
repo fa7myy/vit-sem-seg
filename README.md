@@ -83,6 +83,7 @@ Notes:
 - `--measure-inference-time/--no-measure-inference-time` controls synchronized eval timing.
 - `--profile-flops` optionally estimates FLOPs per image (requires `fvcore`).
 - `--save` saves both final and best checkpoints inside `<run_dir>/checkpoints/` as `<run_name>_final.pth` and `<run_name>_best.pth`.
+- If interrupted with `Ctrl+C` while `--save` is enabled, an interrupted checkpoint is written to `<run_dir>/checkpoints/<run_name>_interrupted.pth`.
 
 ### Full Evaluation
 ```bash
