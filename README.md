@@ -28,6 +28,7 @@ Neck and head are kept fixed. Only the encoder is varied.
 |-- README.md                     # Project overview and usage
 |-- pyproject.toml                # Minimal Python package metadata
 |-- run_experiment.py             # Experiment runner (swappable ViT-B backbones)
+|-- eval_utils.py                 # Evaluation helper utilities (metrics, confusion matrix, FLOPs)
 |-- thesis.egg-info/              # Local packaging metadata (generated)
 |-- ViT-Adapter/                  # Upstream ViT-Adapter code (detection/segmentation/ops)
 |   |-- detection/
@@ -70,11 +71,19 @@ python run_experiment.py \
   --timm-model vit_base_patch14_dinov2.lvd142m \
   --img-size 512 \
   --batch-size 2 \
-  --epochs 10
+  --epochs 10 \
+  --seed 42 \
+  --output-dir runs
 ```
 Notes:
 - `--download/--no-download` toggles torchvision auto-download of VOC (defaults on).
-- `--freeze-backbone/--no-freeze-backbone` controls whether only the adapter + head are trained (default: frozen backbone).
+- `--freeze-backbone` freezes the backbone (default is no freeze / backbone trainable).
+- `--seed` controls Python/NumPy/PyTorch RNG seeds.
+- `--deterministic` enables deterministic kernels for stricter reproducibility (typically slower).
+- `--measure-inference-time/--no-measure-inference-time` controls synchronized eval timing.
+- `--profile-flops` optionally estimates FLOPs per image (requires `fvcore`).
+- `--save /path/final.pth` saves the final model; best-by-mIoU is also saved (default path: `/path/final_best.pth`).
+- `--save-best-path /path/best.pth` overrides the default best-checkpoint location.
 
 ### Full Evaluation
 ```bash
@@ -85,6 +94,29 @@ python run_experiment.py \
   --img-size 512 \
   --eval-only
 ```
+
+### Structured Logging (default on)
+
+Each run writes artifacts under:
+
+```text
+<output-dir>/<run-name>/
+```
+
+Useful flags:
+- `--output-dir runs` base folder for experiment artifacts.
+- `--run-name clip_seed42_ft` explicit run folder name.
+- `--save-logs/--no-save-logs` enable or disable JSON/CSV logging.
+- `--target-miou 0.60` optional threshold used to compute epochs-to-converge.
+
+Logged artifacts include:
+- `run_config.json` full args + resolved backbone source + environment versions + dataset metadata.
+- `load_report.json` matched/missing/unexpected checkpoint key statistics.
+- `train_metrics.csv` epoch-level training loss and epoch time.
+- `eval_metrics.csv` epoch-level `pixel_acc`, `mIoU`, `mean_class_acc`, inference timing.
+- `confusion_matrix_epoch_XXX.csv` and `class_metrics_epoch_XXX.csv` for class-wise error analysis.
+- `summary.json` final run summary (best mIoU epoch, final metrics, convergence info).
+- `events.log` timestamped console log mirror.
 
 ### Backbones
 - `--backbone dinov2` (default timm model: `vit_base_patch14_dinov2.lvd142m`, pretrain size 592)

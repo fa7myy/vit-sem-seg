@@ -16,17 +16,31 @@ Example:
 from __future__ import annotations
 
 import argparse
+import csv
+import json
+import importlib
 import os
-import time
+import platform
+import random
+import re
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+
+from eval_utils import (
+    estimate_flops,
+    evaluate,
+    save_class_metrics_csv,
+    save_confusion_matrix_csv,
+)
 
 try:
     from torchvision.datasets import VOCSegmentation
@@ -95,15 +109,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Global grad-norm clip (0 disables).")
     parser.add_argument("--save", type=str, default="",
-                        help="Optional checkpoint path to save after training.")
+                        help="Optional final checkpoint path to save after training.")
+    add_bool_arg(parser, "save-best", True,
+                 "Save best checkpoint by validation mIoU.")
+    parser.add_argument("--save-best-path", type=str, default="",
+                        help="Optional path for best checkpoint (default derived from --save).")
     parser.add_argument("--eval-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true",
                         help="Run a single forward pass on random input and exit.")
     parser.add_argument("--amp", action="store_true", help="Use mixed precision.")
     parser.add_argument("--torch-compile", action="store_true",
                         help="Use torch.compile when available (CUDA + torch>=2.0).")
-    add_bool_arg(parser, "freeze-backbone", True,
-                 "Freeze ViT-Adapter backbone (linear probe). Use --no-freeze-backbone to train all.")
+    parser.add_argument(
+        "--freeze-backbone",
+        action="store_true",
+        help="Freeze ViT-Adapter backbone (linear probe). Default is backbone trainable.",
+    )
     parser.add_argument("--unfreeze-at-epoch", type=int, default=-1,
                         help="Epoch (1-indexed) to unfreeze last transformer blocks; -1 disables.")
     parser.add_argument("--unfreeze-last-n-blocks", type=int, default=4,
@@ -114,9 +135,173 @@ def parse_args() -> argparse.Namespace:
                  "Enable gradient checkpointing (with_cp) in ViT-Adapter to save memory.")
     add_bool_arg(parser, "miou-ignore-empty", True,
                  "Compute mIoU over classes with non-empty union.")
+    add_bool_arg(parser, "measure-inference-time", True,
+                 "Measure per-image inference time during evaluation (adds sync overhead on CUDA).")
     parser.add_argument("--pretrain-size", type=int, default=0,
                         help="Backbone pretrain resolution (0 selects a sensible default for the chosen backbone).")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for Python/NumPy/PyTorch.")
+    add_bool_arg(parser, "deterministic", False,
+                 "Enable deterministic mode (slower, more reproducible).")
+    add_bool_arg(parser, "save-logs", True,
+                 "Persist structured run artifacts (JSON/CSV).")
+    add_bool_arg(parser, "profile-flops", False,
+                 "Estimate FLOPs per image using fvcore (if available).")
+    parser.add_argument("--output-dir", type=str, default="runs",
+                        help="Base directory for run artifacts.")
+    parser.add_argument("--run-name", type=str, default="",
+                        help="Optional run name (defaults to timestamp_backbone_mode_seed).")
+    parser.add_argument("--target-miou", type=float, default=0.0,
+                        help="Optional convergence threshold. If >0, logs first epoch reaching this mIoU.")
     return parser.parse_args()
+
+
+def seed_everything(seed: int, deterministic: bool) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    else:
+        torch.backends.cudnn.deterministic = False
+        torch.use_deterministic_algorithms(False)
+
+
+def seed_worker(_: int) -> None:
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def sanitize_name(text: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "_", text.strip())
+    cleaned = cleaned.strip("._")
+    return cleaned or "run"
+
+
+def default_run_name(args: argparse.Namespace) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    mode = "eval" if args.eval_only else "train"
+    return sanitize_name(f"{timestamp}_{args.backbone}_{mode}_seed{args.seed}")
+
+
+def make_run_dir(output_dir: str, run_name: str) -> Path:
+    base = Path(output_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    candidate = base / sanitize_name(run_name)
+    if not candidate.exists():
+        candidate.mkdir(parents=True, exist_ok=False)
+        return candidate
+    suffix = 1
+    while True:
+        alt = base / f"{sanitize_name(run_name)}_{suffix:02d}"
+        if not alt.exists():
+            alt.mkdir(parents=True, exist_ok=False)
+            return alt
+        suffix += 1
+
+
+def default_best_ckpt_path(final_ckpt_path: str) -> str:
+    if not final_ckpt_path:
+        return ""
+    path = Path(final_ckpt_path)
+    if path.suffix:
+        return str(path.with_name(f"{path.stem}_best{path.suffix}"))
+    return str(path.with_name(f"{path.name}_best"))
+
+
+def resolve_best_ckpt_path(args: argparse.Namespace) -> str:
+    if not args.save_best:
+        return ""
+    if args.save_best_path:
+        return args.save_best_path
+    return default_best_ckpt_path(args.save)
+
+
+def collect_env_info(device: torch.device) -> Dict[str, Any]:
+    versions = {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "numpy": np.__version__,
+    }
+    for package in ("torchvision", "timm", "mmcv", "mmseg", "mmdet"):
+        try:
+            module = importlib.import_module(package)
+            versions[package] = getattr(module, "__version__", "unknown")
+        except Exception:
+            versions[package] = "not-installed"
+    gpu_names: List[str] = []
+    if torch.cuda.is_available():
+        for idx in range(torch.cuda.device_count()):
+            gpu_names.append(torch.cuda.get_device_name(idx))
+    return {
+        "device": str(device),
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_version": torch.version.cuda,
+        "cudnn_version": torch.backends.cudnn.version(),
+        "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        "gpu_names": gpu_names,
+        "versions": versions,
+    }
+
+
+class RunLogger:
+    train_fields = ("epoch", "avg_loss", "steps", "epoch_time_sec")
+    eval_fields = (
+        "epoch",
+        "pixel_acc",
+        "mIoU",
+        "mean_class_acc",
+        "eval_time_sec",
+        "model_forward_time_sec",
+        "mean_inference_time_ms",
+        "throughput_img_s",
+        "num_eval_images",
+    )
+
+    def __init__(self, run_dir: Path):
+        self.run_dir = run_dir
+        self.events_path = self.run_dir / "events.log"
+        self.train_metrics_path = self.run_dir / "train_metrics.csv"
+        self.eval_metrics_path = self.run_dir / "eval_metrics.csv"
+
+    def write_json(self, name: str, payload: Dict[str, Any]) -> None:
+        path = self.run_dir / name
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+
+    def append_event(self, line: str) -> None:
+        with self.events_path.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+    def _append_csv(self, path: Path, fieldnames: Tuple[str, ...], row: Dict[str, Any]) -> None:
+        write_header = not path.exists()
+        with path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+    def log_train_epoch(self, row: Dict[str, Any]) -> None:
+        self._append_csv(self.train_metrics_path, self.train_fields, row)
+
+    def log_eval_epoch(self, row: Dict[str, Any]) -> None:
+        self._append_csv(self.eval_metrics_path, self.eval_fields, row)
+
+
+def first_epoch_reaching(history: List[Dict[str, Any]], threshold: float) -> int:
+    if threshold <= 0:
+        return -1
+    for row in history:
+        if row["mIoU"] >= threshold:
+            return int(row["epoch"])
+    return -1
 
 
 class Vocab:
@@ -378,48 +563,12 @@ def print_trainable_summary(model: nn.Module, prefix: str) -> None:
           f"head+adapter={format_param_count(head_count)}")
 
 
-def log(msg: str) -> None:
+def log(msg: str, run_logger: RunLogger | None = None) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {msg}")
-
-
-def confusion_matrix(pred: torch.Tensor, target: torch.Tensor,
-                     num_classes: int, ignore_index: int) -> torch.Tensor:
-    mask = target != ignore_index
-    if mask.sum() == 0:
-        return torch.zeros((num_classes, num_classes), dtype=torch.int64)
-    pred = pred[mask]
-    target = target[mask]
-    hist = torch.bincount(
-        num_classes * target + pred,
-        minlength=num_classes * num_classes,
-    ).reshape(num_classes, num_classes)
-    return hist.cpu()
-
-
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device,
-             miou_ignore_empty: bool) -> Dict[str, float]:
-    model.eval()
-    hist = torch.zeros((Vocab.num_classes, Vocab.num_classes), dtype=torch.int64)
-    with torch.no_grad():
-        for images, targets in loader:
-            images = images.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
-            logits = model(images)
-            preds = logits.argmax(dim=1)
-            hist += confusion_matrix(preds, targets, Vocab.num_classes, Vocab.ignore_index)
-    diag = torch.diag(hist).float()
-    acc = diag.sum() / hist.sum().float().clamp(min=1)
-    union = (hist.sum(1) + hist.sum(0) - torch.diag(hist)).float()
-    if miou_ignore_empty:
-        mask = union > 0
-        iu = torch.zeros_like(diag)
-        iu[mask] = diag[mask] / union[mask]
-        miou = iu[mask].mean().item() if mask.any() else 0.0
-    else:
-        iu = diag / union.clamp(min=1)
-        miou = iu.mean().item()
-    return {"pixel_acc": acc.item(), "mIoU": miou}
+    line = f"[{timestamp}] {msg}"
+    print(line)
+    if run_logger is not None:
+        run_logger.append_event(line)
 
 
 def main() -> None:
@@ -430,6 +579,16 @@ def main() -> None:
         raise ValueError("Provide only one of --ckpt or --timm-model (or neither to use defaults).")
     if "--weight-decay-head" not in sys.argv and args.weight_decay != 0.0:
         args.weight_decay_head = args.weight_decay
+
+    seed_everything(args.seed, args.deterministic)
+
+    run_name = args.run_name or default_run_name(args)
+    run_dir: Path | None = None
+    run_logger: RunLogger | None = None
+    if args.save_logs:
+        run_dir = make_run_dir(args.output_dir, run_name)
+        run_name = run_dir.name
+        run_logger = RunLogger(run_dir)
 
     repo_root = (Path(__file__).resolve().parent / "ViT-Adapter").resolve()
     sys.path.insert(0, str(repo_root / "segmentation"))
@@ -446,9 +605,37 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = not args.deterministic
 
     pretrain_size = resolve_pretrain_size(args.backbone, args.pretrain_size)
+    resolved_timm_model = resolve_timm_model(args.backbone, args.timm_model) if not args.ckpt else ""
+    run_start_ts = time.time()
+    run_info: Dict[str, Any] = {
+        "run_name": run_name,
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "command": " ".join(sys.argv),
+        "cwd": str(Path.cwd()),
+        "args": vars(args),
+        "backbone_source": {
+            "backbone": args.backbone,
+            "checkpoint_path": args.ckpt if args.ckpt else None,
+            "resolved_timm_model": resolved_timm_model if resolved_timm_model else None,
+            "pretrain_size": pretrain_size,
+        },
+        "environment": collect_env_info(device),
+    }
+    best_ckpt_path = resolve_best_ckpt_path(args)
+    run_info["checkpointing"] = {
+        "final_checkpoint_path": args.save if args.save else None,
+        "save_best": bool(best_ckpt_path),
+        "best_checkpoint_path": best_ckpt_path if best_ckpt_path else None,
+    }
+    if run_dir is not None:
+        run_info["run_dir"] = str(run_dir.resolve())
+    if run_logger is not None:
+        run_logger.write_json("run_config.json", run_info)
+        log(f"[run] logging artifacts to {run_dir}", run_logger)
+
     backbone = build_backbone(ViTAdapter, pretrain_size, with_cp=args.with_cp)
     model = ViTAdapterLinearProbe(backbone=backbone, num_classes=Vocab.num_classes)
     if args.syncbn:
@@ -458,64 +645,71 @@ def main() -> None:
 
     state_dict = load_pretrained_state_dict(args.backbone, args.timm_model, args.ckpt)
     missing, unexpected = model.backbone.load_state_dict(state_dict, strict=False)
-    if missing:
-        log(f"[load] Missing keys: {len(missing)}")
-    if unexpected:
-        log(f"[load] Unexpected keys: {len(unexpected)}")
-
-    # --- DEBUG: inspect where transformer blocks live & how params are named ---
-    print("\n[debug] backbone top-level children:")
-    for name, mod in model.backbone.named_children():
-        print("  ", name, "->", mod.__class__.__name__)
-
-    # Try common locations for transformer blocks
-    candidates = []
-    if hasattr(model.backbone, "blocks"):
-        candidates.append(("backbone.blocks", model.backbone.blocks))
-    if hasattr(model.backbone, "vit") and hasattr(model.backbone.vit, "blocks"):
-        candidates.append(("backbone.vit.blocks", model.backbone.vit.blocks))
-    if hasattr(model.backbone, "backbone") and hasattr(model.backbone.backbone, "blocks"):
-        candidates.append(("backbone.backbone.blocks", model.backbone.backbone.blocks))
-
-    print("\n[debug] transformer block containers found:")
-    for path, blocks in candidates:
-        try:
-            print(f"  {path}: len={len(blocks)}  block0={blocks[0].__class__.__name__}")
-        except Exception as e:
-            print(f"  {path}: error -> {e}")
-
-    print("\n[debug] first 80 backbone parameter names:")
-    for i, (n, p) in enumerate(model.backbone.named_parameters()):
-        if i >= 80:
-            break
-        print(f"  {i:03d} {n}  shape={tuple(p.shape)}")
-
-    # Also show a few that contain 'blocks' / 'patch_embed' / 'norm'
-    keys = ["blocks", "patch_embed", "norm", "pos_embed", "cls_token", "vit."]
-    print("\n[debug] sample backbone params containing key substrings:")
-    hits = 0
-    for n, p in model.backbone.named_parameters():
-        if any(k in n for k in keys):
-            print("  ", n)
-            hits += 1
-            if hits >= 40:
-                break
-    print("[debug] done\n")
-    # --- END DEBUG ---
+    matched = len(model.backbone.state_dict()) - len(missing)
+    load_report = {
+        "num_loaded_keys": len(state_dict),
+        "num_backbone_keys": len(model.backbone.state_dict()),
+        "matched_keys": matched,
+        "missing_keys": len(missing),
+        "unexpected_keys": len(unexpected),
+        "missing_key_names": sorted(list(missing)),
+        "unexpected_key_names": sorted(list(unexpected)),
+    }
+    log(
+        f"[load] matched={load_report['matched_keys']} missing={load_report['missing_keys']} "
+        f"unexpected={load_report['unexpected_keys']}",
+        run_logger,
+    )
+    if run_logger is not None:
+        run_logger.write_json("load_report.json", load_report)
 
     set_trainable(model, args.freeze_backbone)
     print_trainable_summary(model, "[params]")
+    total_param_count = sum(p.numel() for p in model.parameters())
+    trainable_param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    run_info["model"] = {
+        "num_classes": Vocab.num_classes,
+        "total_params": total_param_count,
+        "trainable_params": trainable_param_count,
+    }
+    run_info["load_report"] = {
+        "matched_keys": load_report["matched_keys"],
+        "missing_keys": load_report["missing_keys"],
+        "unexpected_keys": load_report["unexpected_keys"],
+    }
+    if run_logger is not None:
+        run_logger.write_json("run_config.json", run_info)
+
     model.to(device)
     model_forward = model
     if args.torch_compile and device.type == "cuda" and hasattr(torch, "compile"):
         model_forward = torch.compile(model)
+    if args.profile_flops:
+        flops_info = estimate_flops(model, args.img_size, device)
+        run_info["model"]["flops_profile"] = flops_info
+        if flops_info.get("available"):
+            log(f"[profile] flops_per_image={flops_info['gflops_per_image']:.3f} GFLOPs", run_logger)
+        else:
+            log(f"[profile] skipped FLOPs profiling: {flops_info.get('error', 'unknown error')}", run_logger)
+        if run_logger is not None:
+            run_logger.write_json("run_config.json", run_info)
 
     if args.dry_run:
         model_forward.eval()
         x = torch.randn(1, 3, args.img_size, args.img_size, device=device)
         with torch.no_grad():
             y = model_forward(x)
-        log(f"[dry-run] output shape: {tuple(y.shape)}")
+        log(f"[dry-run] output shape: {tuple(y.shape)}", run_logger)
+        if run_logger is not None:
+            run_logger.write_json(
+                "summary.json",
+                {
+                    "mode": "dry-run",
+                    "finished_at": datetime.now().isoformat(timespec="seconds"),
+                    "total_time_sec": time.time() - run_start_ts,
+                    "output_shape": tuple(y.shape),
+                },
+            )
         return
 
     if not args.data_root:
@@ -544,12 +738,19 @@ def main() -> None:
             "ImageSets/Segmentation, etc. If VOC2012 lives elsewhere, point --data-root to its parent. "
             "Original error: " + str(e)
         ) from e
+
+    train_generator = torch.Generator()
+    train_generator.manual_seed(args.seed)
+    val_generator = torch.Generator()
+    val_generator.manual_seed(args.seed + 1)
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
+        worker_init_fn=seed_worker,
+        generator=train_generator,
     )
     val_loader = DataLoader(
         val_set,
@@ -557,7 +758,20 @@ def main() -> None:
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
+        worker_init_fn=seed_worker,
+        generator=val_generator,
     )
+
+    run_info["dataset"] = {
+        "name": "VOC2012",
+        "train_size": len(train_set),
+        "val_size": len(val_set),
+        "img_size": args.img_size,
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+    }
+    if run_logger is not None:
+        run_logger.write_json("run_config.json", run_info)
 
     criterion = nn.CrossEntropyLoss(ignore_index=Vocab.ignore_index)
     optimizer, trainable_params = build_optimizer(model, args)
@@ -566,14 +780,63 @@ def main() -> None:
 
     if args.eval_only:
         eval_start = time.time()
-        metrics = evaluate(model_forward, val_loader, device, args.miou_ignore_empty)
-        log(f"[eval] pixel_acc={metrics['pixel_acc']:.4f} mIoU={metrics['mIoU']:.4f} "
-            f"time={time.time() - eval_start:.2f}s")
+        metrics = evaluate(
+            model_forward,
+            val_loader,
+            device,
+            Vocab.num_classes,
+            Vocab.ignore_index,
+            args.miou_ignore_empty,
+            args.measure_inference_time,
+        )
+        eval_time = time.time() - eval_start
+        log(
+            f"[eval] pixel_acc={metrics['pixel_acc']:.4f} mIoU={metrics['mIoU']:.4f} "
+            f"mean_class_acc={metrics['mean_class_acc']:.4f} time={eval_time:.2f}s "
+            f"infer={metrics['mean_inference_time_ms']:.2f}ms/img",
+            run_logger,
+        )
+        if run_logger is not None:
+            eval_row = {
+                "epoch": 0,
+                "pixel_acc": metrics["pixel_acc"],
+                "mIoU": metrics["mIoU"],
+                "mean_class_acc": metrics["mean_class_acc"],
+                "eval_time_sec": eval_time,
+                "model_forward_time_sec": metrics["model_forward_time_sec"],
+                "mean_inference_time_ms": metrics["mean_inference_time_ms"],
+                "throughput_img_s": metrics["throughput_img_s"],
+                "num_eval_images": metrics["num_eval_images"],
+            }
+            run_logger.log_eval_epoch(eval_row)
+            save_confusion_matrix_csv(run_logger.run_dir, 0, metrics["confusion_matrix"])
+            save_class_metrics_csv(
+                run_logger.run_dir,
+                0,
+                metrics["per_class_iou"],
+                metrics["per_class_acc"],
+                metrics["gt_count"],
+                metrics["union"],
+            )
+            run_logger.write_json(
+                "summary.json",
+                {
+                    "mode": "eval-only",
+                    "finished_at": datetime.now().isoformat(timespec="seconds"),
+                    "total_time_sec": time.time() - run_start_ts,
+                    "eval": eval_row,
+                    "target_miou": args.target_miou,
+                    "epochs_to_target_miou": 0 if args.target_miou > 0 and metrics["mIoU"] >= args.target_miou else -1,
+                },
+            )
         return
 
     did_unfreeze = False
     log_interval = max(1, args.log_interval)
-    run_start = time.time()
+    train_history: List[Dict[str, Any]] = []
+    eval_history: List[Dict[str, Any]] = []
+    best_miou = float("-inf")
+    best_epoch = -1
     for epoch in range(1, args.epochs + 1):
         # Optional staged unfreezing of the last N transformer blocks.
         if (args.freeze_backbone and not did_unfreeze and args.unfreeze_at_epoch >= 0
@@ -614,25 +877,116 @@ def main() -> None:
             if i % log_interval == 0:
                 avg = running_loss / max(1, running_steps)
                 elapsed = time.time() - iter_start
-                log(f"[train] epoch={epoch} iter={i}/{len(train_loader)} "
-                    f"loss={avg:.4f} batch={images.size(0)} time={elapsed:.2f}s")
+                log(
+                    f"[train] epoch={epoch} iter={i}/{len(train_loader)} "
+                    f"loss={avg:.4f} batch={images.size(0)} time={elapsed:.2f}s",
+                    run_logger,
+                )
                 running_loss = 0.0
                 running_steps = 0
                 iter_start = time.time()
 
         avg_loss = epoch_loss / max(1, epoch_steps)
-        log(f"[train] epoch={epoch} avg_loss={avg_loss:.4f} time={time.time() - epoch_start:.2f}s")
+        epoch_time = time.time() - epoch_start
+        train_row = {
+            "epoch": epoch,
+            "avg_loss": avg_loss,
+            "steps": epoch_steps,
+            "epoch_time_sec": epoch_time,
+        }
+        train_history.append(train_row)
+        if run_logger is not None:
+            run_logger.log_train_epoch(train_row)
+        log(f"[train] epoch={epoch} avg_loss={avg_loss:.4f} time={epoch_time:.2f}s", run_logger)
 
         if args.eval_every > 0 and epoch % args.eval_every == 0:
             eval_start = time.time()
-            metrics = evaluate(model_forward, val_loader, device, args.miou_ignore_empty)
-            log(f"[eval] epoch={epoch} pixel_acc={metrics['pixel_acc']:.4f} mIoU={metrics['mIoU']:.4f} "
-                f"time={time.time() - eval_start:.2f}s")
+            metrics = evaluate(
+                model_forward,
+                val_loader,
+                device,
+                Vocab.num_classes,
+                Vocab.ignore_index,
+                args.miou_ignore_empty,
+                args.measure_inference_time,
+            )
+            eval_time = time.time() - eval_start
+            eval_row = {
+                "epoch": epoch,
+                "pixel_acc": metrics["pixel_acc"],
+                "mIoU": metrics["mIoU"],
+                "mean_class_acc": metrics["mean_class_acc"],
+                "eval_time_sec": eval_time,
+                "model_forward_time_sec": metrics["model_forward_time_sec"],
+                "mean_inference_time_ms": metrics["mean_inference_time_ms"],
+                "throughput_img_s": metrics["throughput_img_s"],
+                "num_eval_images": metrics["num_eval_images"],
+            }
+            eval_history.append(eval_row)
+            if best_ckpt_path and eval_row["mIoU"] > best_miou:
+                best_miou = eval_row["mIoU"]
+                best_epoch = epoch
+                os.makedirs(Path(best_ckpt_path).parent, exist_ok=True)
+                torch.save(
+                    {
+                        "model": model.state_dict(),
+                        "args": vars(args),
+                        "best": {"epoch": best_epoch, "mIoU": best_miou},
+                    },
+                    best_ckpt_path,
+                )
+                log(
+                    f"[save] best path={best_ckpt_path} epoch={best_epoch} mIoU={best_miou:.4f}",
+                    run_logger,
+                )
+            if run_logger is not None:
+                run_logger.log_eval_epoch(eval_row)
+                save_confusion_matrix_csv(run_logger.run_dir, epoch, metrics["confusion_matrix"])
+                save_class_metrics_csv(
+                    run_logger.run_dir,
+                    epoch,
+                    metrics["per_class_iou"],
+                    metrics["per_class_acc"],
+                    metrics["gt_count"],
+                    metrics["union"],
+                )
+            log(
+                f"[eval] epoch={epoch} pixel_acc={metrics['pixel_acc']:.4f} "
+                f"mIoU={metrics['mIoU']:.4f} mean_class_acc={metrics['mean_class_acc']:.4f} "
+                f"time={eval_time:.2f}s infer={metrics['mean_inference_time_ms']:.2f}ms/img",
+                run_logger,
+            )
+
+    summary: Dict[str, Any] = {
+        "mode": "train",
+        "finished_at": datetime.now().isoformat(timespec="seconds"),
+        "total_time_sec": time.time() - run_start_ts,
+        "epochs": args.epochs,
+        "num_train_points": len(train_history),
+        "num_eval_points": len(eval_history),
+        "target_miou": args.target_miou,
+        "epochs_to_target_miou": first_epoch_reaching(eval_history, args.target_miou),
+    }
+    if train_history:
+        summary["final_train_loss"] = train_history[-1]["avg_loss"]
+    if eval_history:
+        best = max(eval_history, key=lambda row: row["mIoU"])
+        summary["best_mIoU"] = best["mIoU"]
+        summary["best_epoch"] = best["epoch"]
+        summary["final_eval"] = eval_history[-1]
+    if best_epoch >= 0 and best_ckpt_path:
+        summary["best_checkpoint_path"] = best_ckpt_path
+    elif args.save_best and not best_ckpt_path:
+        log("[save] best checkpoint disabled because neither --save nor --save-best-path was provided.", run_logger)
 
     if args.save:
         os.makedirs(Path(args.save).parent, exist_ok=True)
-        torch.save({"model": model.state_dict(), "args": vars(args)}, args.save)
-        log(f"[save] {args.save} total_time={time.time() - run_start:.2f}s")
+        torch.save({"model": model.state_dict(), "args": vars(args), "summary": summary}, args.save)
+        summary["checkpoint_path"] = args.save
+        log(f"[save] {args.save} total_time={summary['total_time_sec']:.2f}s", run_logger)
+
+    if run_logger is not None:
+        run_logger.write_json("summary.json", summary)
 
 
 if __name__ == "__main__":
