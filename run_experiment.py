@@ -53,6 +53,10 @@ except Exception as exc:
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
+# OpenAI CLIP normalization (RGB) for inputs scaled to [0, 1].
+CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
 DEFAULT_TIMM_MODELS = {
     "dinov2": "vit_base_patch14_dinov2.lvd142m",
     "clip": "clip_vit_base_patch16_224.openai",
@@ -136,6 +140,19 @@ def parse_args() -> argparse.Namespace:
                  "Compute mIoU over classes with non-empty union.")
     add_bool_arg(parser, "measure-inference-time", True,
                  "Measure per-image inference time during evaluation (adds sync overhead on CUDA).")
+    parser.add_argument(
+        "--input-norm",
+        type=str,
+        choices=["imagenet", "clip"],
+        default="imagenet",
+        help="Image normalization applied after to_tensor(). Keep constant for fair encoder comparisons.",
+    )
+    add_bool_arg(
+        parser,
+        "clip-zero-missing-patch-embed-bias",
+        False,
+        "Zero patch_embed.proj.bias when missing in CLIP checkpoints (helps emulate biasless CLIP patch embedding).",
+    )
     parser.add_argument("--pretrain-size", type=int, default=0,
                         help="Backbone pretrain resolution (0 selects a sensible default for the chosen backbone).")
     parser.add_argument("--seed", type=int, default=42,
@@ -302,14 +319,16 @@ class Vocab:
 
 
 class VocTransform:
-    def __init__(self, size: int):
+    def __init__(self, size: int, mean: Tuple[float, float, float], std: Tuple[float, float, float]):
         self.size = (size, size)
+        self.mean = mean
+        self.std = std
 
     def __call__(self, image, target):
         image = TF.resize(image, self.size, interpolation=InterpolationMode.BICUBIC)
         target = TF.resize(target, self.size, interpolation=InterpolationMode.NEAREST)
         image = TF.to_tensor(image)
-        image = TF.normalize(image, IMAGENET_MEAN, IMAGENET_STD)
+        image = TF.normalize(image, self.mean, self.std)
         target = torch.from_numpy(np.array(target, dtype="uint8")).long()
         return image, target
 
@@ -637,6 +656,19 @@ def main() -> None:
     state_dict = load_pretrained_state_dict(args.backbone, args.timm_model, args.ckpt)
     missing, unexpected = model.backbone.load_state_dict(state_dict, strict=False)
     matched = len(model.backbone.state_dict()) - len(missing)
+    post_load_actions: List[str] = []
+    if (
+        args.backbone == "clip"
+        and args.clip_zero_missing_patch_embed_bias
+        and "patch_embed.proj.bias" in missing
+        and hasattr(model.backbone, "patch_embed")
+        and hasattr(model.backbone.patch_embed, "proj")
+        and getattr(model.backbone.patch_embed.proj, "bias", None) is not None
+    ):
+        with torch.no_grad():
+            model.backbone.patch_embed.proj.bias.zero_()
+        post_load_actions.append("zeroed patch_embed.proj.bias (missing in CLIP checkpoint)")
+        log("[load] post-load: zeroed patch_embed.proj.bias (missing in CLIP checkpoint)", run_logger)
     load_report = {
         "num_loaded_keys": len(state_dict),
         "num_backbone_keys": len(model.backbone.state_dict()),
@@ -645,6 +677,7 @@ def main() -> None:
         "unexpected_keys": len(unexpected),
         "missing_key_names": sorted(list(missing)),
         "unexpected_key_names": sorted(list(unexpected)),
+        "post_load_actions": post_load_actions,
     }
     log(
         f"[load] matched={load_report['matched_keys']} missing={load_report['missing_keys']} "
@@ -706,7 +739,12 @@ def main() -> None:
     if not args.data_root:
         raise ValueError("--data-root is required unless --dry-run is set.")
 
-    transform = VocTransform(args.img_size)
+    if args.input_norm == "clip":
+        image_mean, image_std = CLIP_MEAN, CLIP_STD
+    else:
+        image_mean, image_std = IMAGENET_MEAN, IMAGENET_STD
+    log(f"[data] input_norm={args.input_norm}", run_logger)
+    transform = VocTransform(args.img_size, mean=image_mean, std=image_std)
     try:
         train_set = VOCSegmentation(
             root=args.data_root,

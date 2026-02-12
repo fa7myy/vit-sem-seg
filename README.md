@@ -55,7 +55,7 @@ Minimal setup (CUDA 11.8+ recommended):
 ## Running Experiments
 
 ### Entry Point
-- `run_experiment.py`: standalone runner for linear-probe segmentation with swappable ViT-B backbones (DINOv2 / CLIP / MAE) using ViT-Adapter plus a 1×1 pixel head.
+- `run_experiment.py`: standalone runner for segmentation experiments with swappable ViT-B backbones (DINOv2 / CLIP / MAE) using ViT-Adapter plus a 1x1 pixel head.
 
 ### Quick Sanity Check (no dataset)
 ```bash
@@ -117,6 +117,11 @@ Logged artifacts include:
 - `confusion_matrix_epoch_XXX.csv` and `class_metrics_epoch_XXX.csv` for class-wise error analysis.
 - `summary.json` final run summary (best mIoU epoch, final metrics, convergence info).
 - `events.log` timestamped console log mirror.
+
+### Results Writeup
+
+If you have run experiments and saved artifacts under `runs/`, see:
+- `docs/RESULTS_ANALYSIS.md` for a paper-style analysis and tables based on the current logged runs.
 
 ### Backbones
 - `--backbone dinov2` (default timm model: `vit_base_patch14_dinov2.lvd142m`, pretrain size 592)
