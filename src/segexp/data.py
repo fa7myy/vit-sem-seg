@@ -398,6 +398,20 @@ def build_loaders(
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
     train_set, full_train_size, subset_info = _apply_train_subset(args, train_set, run_logger, split_percent, split_seed)
+    # Log before training starts so sweep runs clearly show the dataset fraction and absolute size.
+    if subset_info is None:
+        log(f"[data] train_subset=100% train_images={len(train_set)}/{int(full_train_size)}", run_logger)
+    else:
+        log(
+            "[data] train_subset={requested}% (realized={realized:.2f}%) train_images={n}/{full} split_seed={seed}".format(
+                requested=int(subset_info["requested_percent"]),
+                realized=float(subset_info["realized_percent"]),
+                n=int(subset_info["subset_size"]),
+                full=int(subset_info["full_train_size"]),
+                seed=int(subset_info["split_seed"]),
+            ),
+            run_logger,
+        )
 
     train_generator = torch.Generator()
     train_generator.manual_seed(args.seed)
