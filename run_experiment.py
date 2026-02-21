@@ -195,6 +195,24 @@ def parse_args() -> argparse.Namespace:
                         help="Optional run name (defaults to timestamp_backbone_mode_seed).")
     parser.add_argument("--target-miou", type=float, default=0.0,
                         help="Optional convergence threshold. If >0, logs first epoch reaching this mIoU.")
+    parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=0,
+        help="Early stop if mIoU has not improved for this many epochs (0 disables).",
+    )
+    parser.add_argument(
+        "--early-stop-min-epochs",
+        type=int,
+        default=0,
+        help="Do not early-stop before this epoch (1-indexed). 0 disables the minimum.",
+    )
+    parser.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=0.0,
+        help="Minimum absolute mIoU improvement required to reset early-stopping patience.",
+    )
     return parser.parse_args()
 
 
@@ -203,6 +221,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--img-size must be divisible by 32.")
     if args.ckpt and args.timm_model:
         raise ValueError("Provide only one of --ckpt or --timm-model (or neither to use defaults).")
+    if args.early_stop_min_epochs < 0:
+        raise ValueError("--early-stop-min-epochs must be >= 0.")
+    if args.early_stop_patience < 0:
+        raise ValueError("--early-stop-patience must be >= 0.")
+    if args.early_stop_patience > 0 and args.eval_every <= 0:
+        raise ValueError("--early-stop-patience requires --eval-every > 0.")
+    if args.early_stop_min_delta < 0:
+        raise ValueError("--early-stop-min-delta must be >= 0.")
 
 
 def parse_splits(raw: List[str] | None) -> List[int]:
@@ -371,6 +397,9 @@ def run_single(
         interrupted,
         interrupted_epoch,
         interrupted_iter,
+        stopped_early,
+        stop_reason,
+        stop_epoch,
     ) = run_training(
         args=args,
         model=model,
@@ -402,6 +431,9 @@ def run_single(
         best_epoch=best_epoch,
         best_ckpt_path=best_ckpt_path,
         interrupted_ckpt_path=interrupted_ckpt_path,
+        stopped_early=stopped_early,
+        stop_reason=stop_reason,
+        stop_epoch=stop_epoch,
     )
     maybe_save_final_checkpoint(
         final_ckpt_path=final_ckpt_path,

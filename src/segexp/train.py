@@ -285,7 +285,7 @@ def run_training(
     num_classes: int,
     ignore_index: int,
     class_names: Tuple[str, ...] | None = None,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float, int, bool, int, int]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float, int, bool, int, int, bool, str, int]:
     did_unfreeze = False
     log_interval = max(1, args.log_interval)
     train_history: List[Dict[str, Any]] = []
@@ -295,6 +295,12 @@ def run_training(
     interrupted = False
     interrupted_epoch = 0
     interrupt_state = {"iter": 0}
+    stopped_early = False
+    stop_reason = ""
+    stop_epoch = -1
+    # Track improvements for plateau-based early stopping separately from checkpointing.
+    plateau_best_miou = float("-inf")
+    plateau_best_epoch = -1
 
     try:
         for epoch in range(1, args.epochs + 1):
@@ -351,6 +357,27 @@ def run_training(
                     f"time={eval_time:.2f}s",
                     run_logger,
                 )
+                patience = int(getattr(args, "early_stop_patience", 0) or 0)
+                if patience > 0:
+                    min_epochs = int(getattr(args, "early_stop_min_epochs", 0) or 0)
+                    min_delta = float(getattr(args, "early_stop_min_delta", 0.0) or 0.0)
+                    current_miou = float(eval_row["mIoU"])
+                    if plateau_best_epoch < 0 or current_miou > (plateau_best_miou + min_delta):
+                        plateau_best_miou = current_miou
+                        plateau_best_epoch = int(epoch)
+                    if plateau_best_epoch >= 0 and epoch >= max(1, min_epochs) and (epoch - int(plateau_best_epoch)) >= patience:
+                        # "No improvement for N epochs" where improvement is defined as
+                        # mIoU > plateau_best_miou + min_delta at some earlier eval epoch.
+                        stopped_early = True
+                        stop_reason = "plateau"
+                        stop_epoch = int(epoch)
+                        log(
+                            f"[early-stop] reason={stop_reason} epoch={stop_epoch} "
+                            f"best_epoch={int(plateau_best_epoch)} best_mIoU={float(plateau_best_miou):.4f} "
+                            f"patience={patience} min_delta={min_delta:.4f}",
+                            run_logger,
+                        )
+                        break
     except KeyboardInterrupt:
         interrupted = True
         log(f"[interrupt] Ctrl+C received at epoch={interrupted_epoch} iter={interrupt_state['iter']}.", run_logger)
@@ -375,6 +402,9 @@ def run_training(
         interrupted,
         interrupted_epoch,
         interrupt_state["iter"],
+        stopped_early,
+        stop_reason,
+        stop_epoch,
     )
 
 
@@ -398,10 +428,13 @@ def build_summary(
     best_epoch: int,
     best_ckpt_path: str,
     interrupted_ckpt_path: str,
+    stopped_early: bool = False,
+    stop_reason: str = "",
+    stop_epoch: int = -1,
 ) -> Dict[str, Any]:
     summary: Dict[str, Any] = {
         "mode": "train",
-        "status": "interrupted" if interrupted else "completed",
+        "status": "interrupted" if interrupted else ("stopped_early" if stopped_early else "completed"),
         "finished_at": datetime.now().isoformat(timespec="seconds"),
         "total_time_sec": time.time() - run_start_ts,
         "epochs": args.epochs,
@@ -410,6 +443,10 @@ def build_summary(
         "target_miou": args.target_miou,
         "epochs_to_target_miou": first_epoch_reaching(eval_history, args.target_miou),
     }
+    if stopped_early:
+        summary["stopped_early"] = True
+        summary["stop_reason"] = stop_reason
+        summary["stop_epoch"] = stop_epoch
     if train_history:
         summary["final_train_loss"] = train_history[-1]["avg_loss"]
     if eval_history:

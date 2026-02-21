@@ -134,6 +134,7 @@ Useful flags:
 - `--run-name clip_seed42_ft` explicit run folder name.
 - `--save-logs/--no-save-logs` enable or disable JSON/CSV logging (default: enabled).
 - `--target-miou 0.60` optional threshold used to compute epochs-to-converge.
+- `--early-stop-patience 10` optionally halts training when mIoU hasn't improved for 10 epochs (useful for measuring convergence speed; keep off for fixed-epoch comparisons).
 
 Logged artifacts include:
 - `run_config.json` full args + resolved backbone source + environment versions + dataset metadata.
