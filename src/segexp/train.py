@@ -18,15 +18,15 @@ from torch.utils.data import DataLoader
 from eval_utils import evaluate, save_class_metrics_csv, save_confusion_matrix_csv
 from .backbone import _unfreeze_last_blocks, build_optimizer, print_trainable_summary
 from .logging import RunLogger, log
-from .model import Vocab
 
 
 def build_training_components(
     args: Any,
     model: nn.Module,
     device: torch.device,
+    ignore_index: int,
 ) -> Tuple[nn.Module, torch.optim.Optimizer, list, bool, torch.cuda.amp.GradScaler]:
-    criterion = nn.CrossEntropyLoss(ignore_index=Vocab.ignore_index)
+    criterion = nn.CrossEntropyLoss(ignore_index=int(ignore_index))
     optimizer, trainable_params = build_optimizer(model, args)
     use_amp = args.amp and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
@@ -39,14 +39,16 @@ def evaluate_once(
     device: torch.device,
     args: Any,
     epoch: int,
+    num_classes: int,
+    ignore_index: int,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], float]:
     eval_start = time.time()
     metrics = evaluate(
         model_forward,
         val_loader,
         device,
-        Vocab.num_classes,
-        Vocab.ignore_index,
+        int(num_classes),
+        int(ignore_index),
         args.miou_ignore_empty,
     )
     eval_time = time.time() - eval_start
@@ -66,11 +68,15 @@ def save_eval_artifacts(
     epoch: int,
     eval_row: Dict[str, Any],
     metrics: Dict[str, Any],
+    class_names: Tuple[str, ...] | None = None,
 ) -> None:
     if run_logger is None:
         return
     run_logger.log_eval_epoch(eval_row)
-    save_confusion_matrix_csv(run_logger.run_dir, epoch, metrics["confusion_matrix"])
+    if class_names is None:
+        save_confusion_matrix_csv(run_logger.run_dir, epoch, metrics["confusion_matrix"])
+    else:
+        save_confusion_matrix_csv(run_logger.run_dir, epoch, metrics["confusion_matrix"], class_names=class_names)
     save_class_metrics_csv(
         run_logger.run_dir,
         epoch,
@@ -78,6 +84,7 @@ def save_eval_artifacts(
         metrics["per_class_acc"],
         metrics["gt_count"],
         metrics["union"],
+        **({} if class_names is None else {"class_names": class_names}),
     )
 
 
@@ -88,17 +95,22 @@ def maybe_run_eval_only(
     device: torch.device,
     run_logger: RunLogger | None,
     run_start_ts: float,
+    num_classes: int,
+    ignore_index: int,
+    class_names: Tuple[str, ...] | None = None,
 ) -> bool:
     if not args.eval_only:
         return False
-    eval_row, metrics, eval_time = evaluate_once(model_forward, val_loader, device, args, epoch=0)
+    eval_row, metrics, eval_time = evaluate_once(
+        model_forward, val_loader, device, args, epoch=0, num_classes=num_classes, ignore_index=ignore_index
+    )
     log(
         f"[eval] pixel_acc={metrics['pixel_acc']:.4f} mIoU={metrics['mIoU']:.4f} "
         f"mean_class_acc={metrics['mean_class_acc']:.4f} time={eval_time:.2f}s",
         run_logger,
     )
     if run_logger is not None:
-        save_eval_artifacts(run_logger, 0, eval_row, metrics)
+        save_eval_artifacts(run_logger, 0, eval_row, metrics, class_names=class_names)
         run_logger.write_json(
             "summary.json",
             {
@@ -270,6 +282,9 @@ def run_training(
     best_ckpt_path: str,
     interrupted_ckpt_path: str,
     run_logger: RunLogger | None,
+    num_classes: int,
+    ignore_index: int,
+    class_names: Tuple[str, ...] | None = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float, int, bool, int, int]:
     did_unfreeze = False
     log_interval = max(1, args.log_interval)
@@ -315,7 +330,9 @@ def run_training(
             interrupt_state["iter"] = 0
 
             if args.eval_every > 0 and epoch % args.eval_every == 0:
-                eval_row, metrics, eval_time = evaluate_once(model_forward, val_loader, device, args, epoch=epoch)
+                eval_row, metrics, eval_time = evaluate_once(
+                    model_forward, val_loader, device, args, epoch=epoch, num_classes=num_classes, ignore_index=ignore_index
+                )
                 eval_history.append(eval_row)
                 best_miou, best_epoch = maybe_save_best_checkpoint(
                     best_ckpt_path=best_ckpt_path,
@@ -327,7 +344,7 @@ def run_training(
                     best_epoch=best_epoch,
                     run_logger=run_logger,
                 )
-                save_eval_artifacts(run_logger, epoch, eval_row, metrics)
+                save_eval_artifacts(run_logger, epoch, eval_row, metrics, class_names=class_names)
                 log(
                     f"[eval] epoch={epoch} pixel_acc={metrics['pixel_acc']:.4f} "
                     f"mIoU={metrics['mIoU']:.4f} mean_class_acc={metrics['mean_class_acc']:.4f} "

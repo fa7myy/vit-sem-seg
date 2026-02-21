@@ -1,6 +1,6 @@
 # Vision Encoder Ablations for Segmentation
 
-This repository contains the experimental codebase for studying the effect of pretrained vision encoders such as CLIP, DINOv2, and MAE on semantic segmentation.
+This repository contains the experimental codebase for studying the effect of pretrained vision encoders (CLIP, DINOv2, MAE) on semantic segmentation under controlled conditions.
 
 ---
 
@@ -25,16 +25,14 @@ Neck and head are kept fixed. Only the encoder is varied.
 ## Repository Structure
 
 ```
-|-- README.md                     # Project overview and usage
-|-- pyproject.toml                # Minimal Python package metadata
-|-- run_experiment.py             # Experiment runner (swappable ViT-B backbones)
-|-- eval_utils.py                 # Evaluation helper utilities (metrics, confusion matrix, FLOPs)
-|-- thesis.egg-info/              # Local packaging metadata (generated)
-|-- ViT-Adapter/                  # Upstream ViT-Adapter code (detection/segmentation/ops)
-|   |-- detection/
-|   |-- segmentation/
-|   `-- wsdm2023/
-`-- build/                        # (optional) build artifacts
+|-- run_experiment.py             # Main experiment runner (CLI entrypoint)
+|-- src/segexp/                   # Experiment helpers (data/backbone/train/logging)
+|-- eval_utils.py                 # Metrics + FLOPs helpers
+|-- tests/                        # Pytests (synthetic data; no dataset download required)
+|-- docs/                         # Notes and analysis docs
+|-- Plan.md                       # Refactor plan / notes (project-specific)
+|-- ViT-Adapter/                  # Vendored upstream (treat as read-only)
+`-- runs/                         # Run artifacts (logs/checkpoints/results)
 ```
 
 ---
@@ -55,7 +53,7 @@ Minimal setup (CUDA 11.8+ recommended):
 ## Running Experiments
 
 ### Entry Point
-- `run_experiment.py`: standalone runner for segmentation experiments with swappable ViT-B backbones (DINOv2 / CLIP / MAE) using ViT-Adapter plus a 1x1 pixel head.
+- `run_experiment.py`: runner for segmentation experiments with swappable ViT-B backbones (DINOv2 / CLIP / MAE) using ViT-Adapter + a segmentation head.
 
 ### Quick Sanity Check (no dataset)
 ```bash
@@ -63,10 +61,15 @@ python run_experiment.py --backbone dinov2 --dry-run
 ```
 Prints output tensor shape to confirm the pipeline loads and runs.
 
-### Full Training (VOC 2012)
+### VOC2012 Training
+
+`--data-root` can point to:
+- a folder that contains `VOC2012/` (with `JPEGImages/`, `SegmentationClass/`, etc.), or
+- the `VOC2012/` folder itself.
+
 ```bash
 python run_experiment.py \
-  --data-root /path/to/VOCdevkit \
+  --data-root /path/to/VOC2012_or_parent \
   --backbone dinov2 \
   --timm-model vit_base_patch14_dinov2.lvd142m \
   --img-size 512 \
@@ -77,18 +80,41 @@ python run_experiment.py \
 ```
 Notes:
 - `--download/--no-download` toggles torchvision auto-download of VOC (defaults on).
-- `--freeze-backbone` freezes the backbone (default is no freeze / backbone trainable).
+- Default is backbone trainable; pass `--freeze-backbone` for a linear-probe style run.
 - `--seed` controls Python/NumPy/PyTorch RNG seeds.
 - `--deterministic` enables deterministic kernels for stricter reproducibility (typically slower).
-- `--measure-inference-time/--no-measure-inference-time` controls synchronized eval timing.
 - `--profile-flops` optionally estimates FLOPs per image (requires `fvcore`).
 - `--save` saves both final and best checkpoints inside `<run_dir>/checkpoints/` as `<run_name>_final.pth` and `<run_name>_best.pth`.
 - If interrupted with `Ctrl+C` while `--save` is enabled, an interrupted checkpoint is written to `<run_dir>/checkpoints/<run_name>_interrupted.pth`.
 
+### VOC2012 trainaug (SegmentationClassAug)
+
+If you have a local VOC layout that includes:
+- `SegmentationClassAug/`
+- `trainaug.txt` (either in `VOC2012/` or `VOC2012/ImageSets/Segmentation/`)
+
+you can train on the augmented split:
+
+```bash
+python run_experiment.py \
+  --dataset voc \
+  --data-root /path/to/VOC2012_or_parent \
+  --voc-train-split trainaug \
+  --voc-aug-mask-dir SegmentationClassAug \
+  --backbone dinov2 \
+  --img-size 512 \
+  --batch-size 2 \
+  --epochs 10 \
+  --seed 42 \
+  --output-dir runs
+```
+
+Note: `--download` is not supported for `--voc-train-split trainaug` (the augmented masks must exist locally).
+
 ### Full Evaluation
 ```bash
 python run_experiment.py \
-  --data-root /path/to/VOCdevkit \
+  --data-root /path/to/VOC2012_or_parent \
   --backbone clip \
   --timm-model clip_vit_base_patch16_224.openai \
   --img-size 512 \
@@ -106,14 +132,14 @@ Each run writes artifacts under:
 Useful flags:
 - `--output-dir runs` base folder for experiment artifacts.
 - `--run-name clip_seed42_ft` explicit run folder name.
-- `--save-logs/--no-save-logs` enable or disable JSON/CSV logging.
+- `--save-logs/--no-save-logs` enable or disable JSON/CSV logging (default: enabled).
 - `--target-miou 0.60` optional threshold used to compute epochs-to-converge.
 
 Logged artifacts include:
 - `run_config.json` full args + resolved backbone source + environment versions + dataset metadata.
 - `load_report.json` matched/missing/unexpected checkpoint key statistics.
 - `train_metrics.csv` epoch-level training loss and epoch time.
-- `eval_metrics.csv` epoch-level `pixel_acc`, `mIoU`, `mean_class_acc`, inference timing.
+- `eval_metrics.csv` epoch-level `pixel_acc`, `mIoU`, `mean_class_acc`.
 - `confusion_matrix_epoch_XXX.csv` and `class_metrics_epoch_XXX.csv` for class-wise error analysis.
 - `summary.json` final run summary (best mIoU epoch, final metrics, convergence info).
 - `events.log` timestamped console log mirror.
@@ -129,6 +155,52 @@ If you have run experiments and saved artifacts under `runs/`, see:
 - `--backbone mae`  (default timm model: `mae_vit_base_patch16`, pretrain size 224)
 - Custom weights: pass `--ckpt /path/to/model.pth` (overrides timm).
 
+### Low-Data Sweeps (`--splits`)
+
+To evaluate data efficiency, you can run a deterministic sweep over multiple train-data percentages:
+
+```bash
+python run_experiment.py \
+  --data-root /path/to/VOC2012_or_parent \
+  --dataset voc \
+  --backbone dinov2 \
+  --splits 10 25 50 100 \
+  --split-seed 123 \
+  --seed 42 \
+  --output-dir runs
+```
+
+Notes:
+- Each split runs a full train/eval with identical hyperparameters.
+- Subsets are selected deterministically via `torch.randperm` with `--split-seed` (defaults to `--seed` when `--split-seed=-1`).
+- Exact indices are saved per run as `train_subset_indices.json`.
+
+### CamVid (RGB masks)
+
+CamVid uses RGB-encoded label images. The loader reads `class_dict.csv` to build the palette mapping.
+
+Expected layout:
+```text
+CamVid/
+  train/         train_labels/
+  val/           val_labels/
+  test/          test_labels/      (optional for training; useful for evaluation scripts)
+  class_dict.csv
+```
+
+Example:
+```bash
+python run_experiment.py \
+  --dataset camvid \
+  --data-root /path/to/CamVid_or_parent \
+  --backbone dinov2 \
+  --img-size 512 \
+  --batch-size 2 \
+  --epochs 10 \
+  --seed 42 \
+  --output-dir runs
+```
+
 ---
 
 ## Reproducibility
@@ -139,6 +211,14 @@ If you have run experiments and saved artifacts under `runs/`, see:
 - Results are saved with encoder dataset and seed identifiers
 
 This enables exact reproduction of all experiments.
+
+## Tests
+
+Pytests validate that dataset loading and label decoding behave as expected (using synthetic temporary folders; no dataset download required):
+
+```bash
+pytest -q
+```
 
 ---
 
@@ -157,8 +237,6 @@ Models are evaluated across accuracy, efficiency, and learning behavior using th
   Shows class level prediction errors and label confusions.
 
 ### Efficiency
-- **Inference Time**  
-  Average time to process a single image.
 - **Parameters and FLOPs**  
   Measures model size and computational cost.
 

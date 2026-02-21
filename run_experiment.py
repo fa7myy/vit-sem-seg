@@ -41,7 +41,7 @@ from segexp.backbone import (
     set_trainable,
     update_model_run_info,
 )
-from segexp.data import build_voc_loaders
+from segexp.data import build_loaders, get_dataset_spec
 from segexp.logging import (
     RunLogger,
     init_device,
@@ -76,6 +76,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=str, default="",
                         help="Path containing VOCdevkit (torchvision VOCSegmentation root).")
     add_bool_arg(parser, "download", True, "Download VOC2012 via torchvision if not present.")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=["voc", "camvid"],
+        default="voc",
+        help="Dataset to train/evaluate on.",
+    )
+    parser.add_argument(
+        "--voc-train-split",
+        type=str,
+        choices=["train", "trainaug"],
+        default="train",
+        help="VOC training split (val is always VOC2012 val).",
+    )
+    parser.add_argument(
+        "--voc-aug-mask-dir",
+        type=str,
+        default="SegmentationClassAug",
+        help="VOC trainaug mask directory relative to VOC2012 root.",
+    )
+    parser.add_argument(
+        "--camvid-ignore-class-names",
+        type=str,
+        default="Void,Unlabelled,Unlabeled",
+        help="Comma-separated CamVid class names to map to ignore_index (255).",
+    )
     parser.add_argument("--backbone", type=str, choices=["dinov2", "clip", "mae"], default="dinov2",
                         help="Pretrained ViT-B source.")
     parser.add_argument("--ckpt", type=str, default="",
@@ -302,26 +328,39 @@ def run_single(
         interrupted_ckpt_path,
     ) = init_run_context(args, device, pretrain_size, resolved_timm_model)
 
-    model = build_probe_model(ViTAdapter, args, pretrain_size)
+    spec = get_dataset_spec(args)
+    model = build_probe_model(ViTAdapter, args, pretrain_size, num_classes=spec.num_classes)
     load_report = load_backbone_weights(args, model, run_logger)
     set_trainable(model, args.freeze_backbone)
     print_trainable_summary(model, "[params]")
-    update_model_run_info(model, run_info, load_report, run_logger)
+    update_model_run_info(model, run_info, load_report, run_logger, num_classes=spec.num_classes)
 
     model_forward = configure_model_runtime(args, model, device, run_info, run_logger)
     if maybe_run_dry_run(args, model_forward, device, run_logger, run_start_ts):
         return
 
-    train_loader, val_loader = build_voc_loaders(
+    train_loader, val_loader, spec = build_loaders(
         args,
         run_logger,
         run_info,
         split_percent=split_percent,
         split_seed=split_seed,
     )
-    criterion, optimizer, trainable_params, use_amp, scaler = build_training_components(args, model, device)
+    criterion, optimizer, trainable_params, use_amp, scaler = build_training_components(
+        args, model, device, ignore_index=spec.ignore_index
+    )
 
-    if maybe_run_eval_only(args, model_forward, val_loader, device, run_logger, run_start_ts):
+    if maybe_run_eval_only(
+        args,
+        model_forward,
+        val_loader,
+        device,
+        run_logger,
+        run_start_ts,
+        num_classes=spec.num_classes,
+        ignore_index=spec.ignore_index,
+        class_names=spec.class_names,
+    ):
         return
 
     (
@@ -347,6 +386,9 @@ def run_single(
         best_ckpt_path=best_ckpt_path,
         interrupted_ckpt_path=interrupted_ckpt_path,
         run_logger=run_logger,
+        num_classes=spec.num_classes,
+        ignore_index=spec.ignore_index,
+        class_names=spec.class_names,
     )
 
     summary = build_summary(

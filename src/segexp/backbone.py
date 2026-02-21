@@ -128,9 +128,9 @@ def build_backbone(ViTAdapter: Any, pretrain_size: int, with_cp: bool) -> nn.Mod
     )
 
 
-def build_probe_model(ViTAdapter: Any, args: Any, pretrain_size: int) -> nn.Module:
+def build_probe_model(ViTAdapter: Any, args: Any, pretrain_size: int, num_classes: int = Vocab.num_classes) -> nn.Module:
     backbone = build_backbone(ViTAdapter, pretrain_size, with_cp=args.with_cp)
-    model = ViTAdapterLinearProbe(backbone=backbone, num_classes=Vocab.num_classes)
+    model = ViTAdapterLinearProbe(backbone=backbone, num_classes=int(num_classes))
     if args.syncbn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     else:
@@ -181,11 +181,12 @@ def update_model_run_info(
     run_info: Dict[str, Any],
     load_report: Dict[str, Any],
     run_logger: RunLogger | None,
+    num_classes: int = Vocab.num_classes,
 ) -> None:
     total_param_count = sum(p.numel() for p in model.parameters())
     trainable_param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     run_info["model"] = {
-        "num_classes": Vocab.num_classes,
+        "num_classes": int(num_classes),
         "total_params": total_param_count,
         "trainable_params": trainable_param_count,
     }
