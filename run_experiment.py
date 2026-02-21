@@ -92,8 +92,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--backbone-lr", type=float, default=5e-6,
                         help="Smaller LR for pretrained transformer blocks.")
-    parser.add_argument("--weight-decay", type=float, default=0.0,
-                        help="Deprecated (use --weight-decay-head).")
     parser.add_argument("--weight-decay-head", type=float, default=0.0,
                         help="Weight decay for head + adapter params.")
     parser.add_argument("--weight-decay-backbone", type=float, default=0.05,
@@ -127,8 +125,6 @@ def parse_args() -> argparse.Namespace:
                  "Enable gradient checkpointing (with_cp) in ViT-Adapter to save memory.")
     add_bool_arg(parser, "miou-ignore-empty", True,
                  "Compute mIoU over classes with non-empty union.")
-    add_bool_arg(parser, "measure-inference-time", True,
-                 "Measure per-image inference time during evaluation (adds sync overhead on CUDA).")
     parser.add_argument(
         "--input-norm",
         type=str,
@@ -181,8 +177,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--img-size must be divisible by 32.")
     if args.ckpt and args.timm_model:
         raise ValueError("Provide only one of --ckpt or --timm-model (or neither to use defaults).")
-    if "--weight-decay-head" not in sys.argv and args.weight_decay != 0.0:
-        args.weight_decay_head = args.weight_decay
 
 
 def parse_splits(raw: List[str] | None) -> List[int]:

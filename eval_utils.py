@@ -95,37 +95,21 @@ def evaluate(
     num_classes: int,
     ignore_index: int,
     miou_ignore_empty: bool,
-    measure_inference_time: bool,
 ) -> Dict[str, Any]:
     model.eval()
     hist = torch.zeros((num_classes, num_classes), dtype=torch.int64)
     total_images = 0
-    model_forward_time_sec = 0.0
     with torch.no_grad():
         for images, targets in loader:
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
-            if measure_inference_time and device.type == "cuda":
-                torch.cuda.synchronize(device)
-            forward_start = time.time()
             logits = model(images)
-            if measure_inference_time and device.type == "cuda":
-                torch.cuda.synchronize(device)
-            if measure_inference_time:
-                model_forward_time_sec += time.time() - forward_start
             preds = logits.argmax(dim=1)
             hist += confusion_matrix(preds, targets, num_classes, ignore_index)
             total_images += images.size(0)
     metrics = metrics_from_hist(hist, miou_ignore_empty)
     metrics["confusion_matrix"] = hist
     metrics["num_eval_images"] = total_images
-    metrics["model_forward_time_sec"] = model_forward_time_sec
-    if total_images > 0 and model_forward_time_sec > 0:
-        metrics["mean_inference_time_ms"] = 1000.0 * model_forward_time_sec / total_images
-        metrics["throughput_img_s"] = total_images / model_forward_time_sec
-    else:
-        metrics["mean_inference_time_ms"] = 0.0
-        metrics["throughput_img_s"] = 0.0
     return metrics
 
 

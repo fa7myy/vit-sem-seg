@@ -112,9 +112,6 @@ class RunLogger:
         "mIoU",
         "mean_class_acc",
         "eval_time_sec",
-        "model_forward_time_sec",
-        "mean_inference_time_ms",
-        "throughput_img_s",
         "num_eval_images",
     )
 

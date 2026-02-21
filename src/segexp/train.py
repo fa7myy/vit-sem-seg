@@ -48,7 +48,6 @@ def evaluate_once(
         Vocab.num_classes,
         Vocab.ignore_index,
         args.miou_ignore_empty,
-        args.measure_inference_time,
     )
     eval_time = time.time() - eval_start
     eval_row = {
@@ -57,9 +56,6 @@ def evaluate_once(
         "mIoU": metrics["mIoU"],
         "mean_class_acc": metrics["mean_class_acc"],
         "eval_time_sec": eval_time,
-        "model_forward_time_sec": metrics["model_forward_time_sec"],
-        "mean_inference_time_ms": metrics["mean_inference_time_ms"],
-        "throughput_img_s": metrics["throughput_img_s"],
         "num_eval_images": metrics["num_eval_images"],
     }
     return eval_row, metrics, eval_time
@@ -98,8 +94,7 @@ def maybe_run_eval_only(
     eval_row, metrics, eval_time = evaluate_once(model_forward, val_loader, device, args, epoch=0)
     log(
         f"[eval] pixel_acc={metrics['pixel_acc']:.4f} mIoU={metrics['mIoU']:.4f} "
-        f"mean_class_acc={metrics['mean_class_acc']:.4f} time={eval_time:.2f}s "
-        f"infer={metrics['mean_inference_time_ms']:.2f}ms/img",
+        f"mean_class_acc={metrics['mean_class_acc']:.4f} time={eval_time:.2f}s",
         run_logger,
     )
     if run_logger is not None:
@@ -336,7 +331,7 @@ def run_training(
                 log(
                     f"[eval] epoch={epoch} pixel_acc={metrics['pixel_acc']:.4f} "
                     f"mIoU={metrics['mIoU']:.4f} mean_class_acc={metrics['mean_class_acc']:.4f} "
-                    f"time={eval_time:.2f}s infer={metrics['mean_inference_time_ms']:.2f}ms/img",
+                    f"time={eval_time:.2f}s",
                     run_logger,
                 )
     except KeyboardInterrupt:
